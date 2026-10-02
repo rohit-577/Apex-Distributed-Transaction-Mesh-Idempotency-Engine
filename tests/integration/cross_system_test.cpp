@@ -20,6 +20,7 @@
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/IdempotencyService.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/IdempotencyRepository.hpp"
 #include "persistence/PgConnection.hpp"
@@ -99,7 +100,7 @@ TEST_F(PgFixture, EpochPersistedButProcessDiesBeforeExecuting) {
   const std::string key = unique_key("case2");
   const std::string fp = fp_of(R"({"c":2})");
   auto db = raw_connect();
-  ASSERT_EQ(repo().try_acquire(*db, key, fp).outcome,
+  ASSERT_EQ(repo().try_acquire(*db, key, fp, R"({"c":2})").outcome,
             persistence::AcquireOutcome::Created);
   ASSERT_EQ(repo().try_recover(*db, key, fp, 1), 2);
   // ...owner dies here, operation never ran...
@@ -141,7 +142,8 @@ TEST_F(PgFixture, StaleOwnerCannotOverwriteNewerGeneration) {
   ASSERT_EQ(lease_a.result, coordination::LeaseAttempt::Result::Acquired);
   {
     auto db = raw_connect();
-    const persistence::AcquireResult created = repo().try_acquire(*db, key, fp);
+    const persistence::AcquireResult created =
+        repo().try_acquire(*db, key, fp, R"({"race":"stale"})");
     ASSERT_EQ(created.outcome, persistence::AcquireOutcome::Created);
     ASSERT_EQ(created.record.fencing_epoch, 1);
   }
@@ -217,8 +219,9 @@ TEST_F(PgFixture, RedisDownDuringOwnershipAttemptFailsClosed) {
   auto dead_redis =
       std::make_shared<coordination::RedisClient>(std::move(dead_endpoint));
   apex::observability::Logger quiet(apex::observability::Level::Error);
+  auto metrics = std::make_shared<apex::observability::Metrics>();
   auto dead_leases = std::make_shared<coordination::LeaseManager>(
-      dead_redis, std::chrono::milliseconds(10000), quiet);
+      dead_redis, std::chrono::milliseconds(10000), quiet, metrics);
   auto dead_service = make_service(shared_pool(), quiet, dead_leases);
 
   test::TestServer server(cross_config(), dead_service);
@@ -275,7 +278,7 @@ TEST_F(PgFixture, PostgresFailureDuringOwnershipFailsSafe) {
     const std::string key = unique_key("case6-killed");
     const std::string fp = fp_of(R"({"s":6})");
     auto victim = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*victim, key, fp).outcome,
+    ASSERT_EQ(repo().try_acquire(*victim, key, fp, R"({"s":6})").outcome,
               persistence::AcquireOutcome::Created);
 
     // Another backend terminates the victim's connection mid-transaction.

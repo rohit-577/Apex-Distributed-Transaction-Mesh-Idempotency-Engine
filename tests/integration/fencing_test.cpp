@@ -34,7 +34,7 @@ TEST_F(PgFixture, FirstOwnerReceivesEpochOne) {
   const std::string key = unique_key("epoch1");
   auto db = raw_connect();
 
-  const AcquireResult created = repo().try_acquire(*db, key, kFp);
+  const AcquireResult created = repo().try_acquire(*db, key, kFp, R"({})");
   ASSERT_EQ(created.outcome, AcquireOutcome::Created);
   EXPECT_EQ(created.record.fencing_epoch, 1);
 
@@ -48,7 +48,7 @@ TEST_F(PgFixture, RecoveryAdvancesExactlyOneGeneration) {
   REQUIRE_PG();
   const std::string key = unique_key("epoch2");
   auto db = raw_connect();
-  ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+  ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
 
   const std::optional<std::int64_t> second = repo().try_recover(*db, key, kFp, 1);
   ASSERT_TRUE(second.has_value());
@@ -69,7 +69,7 @@ TEST_F(PgFixture, RecoveryRefusesWrongEpochAndWrongState) {
   REQUIRE_PG();
   const std::string key = unique_key("epochrefuse");
   auto db = raw_connect();
-  ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+  ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
 
   EXPECT_FALSE(repo().try_recover(*db, key, kFp, 0).has_value()) << "epoch 0 never exists";
   EXPECT_FALSE(repo().try_recover(*db, key, kFp, 2).has_value()) << "epoch 2 not yet assigned";
@@ -89,7 +89,7 @@ TEST_F(PgFixture, CurrentEpochCanCommitStaleEpochCannot) {
   REQUIRE_PG();
   const std::string key = unique_key("epochcommit");
   auto db = raw_connect();
-  ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+  ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
   ASSERT_EQ(repo().try_recover(*db, key, kFp, 1), 2);
 
   EXPECT_FALSE(repo().complete(*db, key, kFp, 1, 200, "stale-body", "application/json"));
@@ -115,7 +115,7 @@ TEST_F(PgFixture, StaleEpochCannotTouchTerminalStates) {
   for (const char* stem : {"stale-completed", "stale-failed"}) {
     const std::string key = unique_key(stem);
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+    ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
     ASSERT_EQ(repo().try_recover(*db, key, kFp, 1), 2);
     if (std::string(stem) == "stale-completed") {
       ASSERT_TRUE(repo().complete(*db, key, kFp, 2, 200, "winner", "application/json"));
@@ -146,7 +146,7 @@ TEST_F(PgFixture, ConcurrentRecoveryElectsExactlyOneWinner) {
   const std::string key = unique_key("epochrace");
   {
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+    ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
   }
 
   constexpr int kRecoverers = 8;
@@ -187,7 +187,7 @@ TEST_F(PgFixture, RacingTerminalWritesLeaveOnlyTheCurrentResult) {
   const std::string key = unique_key("epochwrite-race");
   {
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, key, kFp).outcome, AcquireOutcome::Created);
+    ASSERT_EQ(repo().try_acquire(*db, key, kFp, R"({})").outcome, AcquireOutcome::Created);
     ASSERT_EQ(repo().try_recover(*db, key, kFp, 1), 2);
   }
 

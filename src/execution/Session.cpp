@@ -9,10 +9,12 @@
 #include <nlohmann/json.hpp>
 
 #include "execution/DependencyChecker.hpp"
+#include "idempotency/CorrelationId.hpp"
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/IdempotencyKey.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 
 namespace apex::execution {
 
@@ -58,6 +60,23 @@ Session::Session(tcp::socket socket, const config::Config& config, std::string v
       logger_(logger),
       wait_timer_(stream_.get_executor()) {}
 
+Session::~Session() {
+  // Last-resort waiter release (abrupt client disconnect with a suspended
+  // session): drops only this waiter's registry slot. Counted as a
+  // cancellation (the client went away mid-wait), distinct from abort
+  // (shutdown/timer path). Runs on whatever thread drops the final
+  // reference; abort-safe (registry mutex only), and the service/registry
+  // outlive every session (main/fixture destruction order).
+  if (!pending_wait_) {
+    return;
+  }
+  service_->metrics()->increment_waiter_cancellations();
+  if (pending_wait_->waiter_id != 0 && service_ != nullptr) {
+    service_->registry()->unregister(pending_wait_->channel, pending_wait_->waiter_id);
+  }
+  pending_wait_.reset();
+}
+
 void Session::do_read() {
   stream_.expires_after(std::chrono::seconds(30));
   parser_.emplace();
@@ -99,9 +118,15 @@ void Session::handle_request() {
 
   // POST /v1/operations needs the durable service and therefore cannot be
   // answered by the pure Router (which sees no I/O and no state). It is
-  // dispatched here, exactly like /ready.
+  // dispatched here, exactly like /ready. Same for GET /metrics (needs the
+  // live process counters).
   if (path_only(target) == "/v1/operations") {
     handle_operations(request_.version(), request_.keep_alive());
+    return;
+  }
+
+  if (path_only(target) == "/metrics") {
+    handle_metrics(request_.version(), request_.keep_alive());
     return;
   }
 
@@ -136,10 +161,35 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
     return;
   }
 
+  // Every POST to this route counts, including validation failures below.
+  if (service_ != nullptr && service_->metrics() != nullptr) {
+    service_->metrics()->increment_requests_total();
+  }
+
+  // Correlation ID: client-supplied X-Request-ID when well-formed, otherwise
+  // freshly minted. Metadata only — never part of the fingerprint, echoed
+  // back on every response from this route.
+  correlation_id_.clear();
+  if (const auto id_field = request_.find("X-Request-ID");
+      id_field != request_.end()) {
+    if (const auto valid =
+            idempotency::validate_correlation_id(std::string(id_field->value()))) {
+      correlation_id_ = *valid;
+    }
+  }
+  if (correlation_id_.empty()) {
+    try {
+      correlation_id_ = idempotency::new_correlation_id();
+    } catch (const std::exception&) {
+      correlation_id_.clear();  // Degraded but functional: no echo, no cid.
+    }
+  }
+
   // Idempotency-Key is required and validated before anything touches the
   // database. Beast header lookup is case-insensitive, as HTTP requires.
   const auto key_field = request_.find("Idempotency-Key");
   if (key_field == request_.end()) {
+    count_validation_failure();
     send_json(400, R"({"error":"missing_idempotency_key"})", version, keep_alive);
     return;
   }
@@ -149,6 +199,7 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
     const nlohmann::json body = {
         {"error", "invalid_idempotency_key"},
         {"reason", idempotency::key_problem_reason(key_check.problem)}};
+    count_validation_failure();
     send_json(400, body.dump(), version, keep_alive);
     return;
   }
@@ -156,6 +207,7 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
   const idempotency::Fingerprint fingerprint =
       idempotency::fingerprint_for("POST", "/v1/operations", request_.body());
   if (!fingerprint.ok) {
+    count_validation_failure();
     send_json(400, R"({"error":"invalid_json_body"})", version, keep_alive);
     return;
   }
@@ -174,7 +226,8 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
   // final post lands on a stopped executor and is dropped safely.
   stream_.expires_never();
   auto self = shared_from_this();
-  idempotency::OperationRequest op_request{key, fingerprint.hex, fingerprint.canonical_body};
+  idempotency::OperationRequest op_request{key, fingerprint.hex, fingerprint.canonical_body,
+                                           correlation_id_};
   asio::post(*db_pool_,
              [self, op_request = std::move(op_request), version, keep_alive]() mutable {
                idempotency::OperationOutcome outcome;
@@ -207,6 +260,28 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
              });
 }
 
+void Session::count_validation_failure() {
+  if (service_ != nullptr && service_->metrics() != nullptr) {
+    service_->metrics()->increment_validation_failures();
+  }
+}
+
+void Session::handle_metrics(unsigned version, bool keep_alive) {
+  if (request_.method() != http::verb::get) {
+    send_json(405, R"({"error":"method_not_allowed"})", version, keep_alive, "GET");
+    return;
+  }
+  if (service_ == nullptr || service_->metrics() == nullptr) {
+    send_json(503, R"({"error":"storage_unavailable"})", version, keep_alive);
+    return;
+  }
+  // Prometheus exposition, text format. Fixed counters only — no request
+  // data, no keys, no labels derived from user input (bounded cardinality
+  // by construction; a test asserts unique keys never appear here).
+  send_json(200, service_->metrics()->render_prometheus(), version, keep_alive, "",
+            "text/plain; version=0.0.4");
+}
+
 void Session::enter_wait(idempotency::OperationRequest request, unsigned version,
                          bool keep_alive) {
   // Strand context (posted back from the pool verdict).
@@ -222,6 +297,7 @@ void Session::enter_wait(idempotency::OperationRequest request, unsigned version
                   std::chrono::milliseconds(options.timeout_ms);
   wait.settled = false;
   pending_wait_ = std::move(wait);
+  service_->metrics()->increment_waiters_started();
   logger_wait_event("started");
   continue_wait();
 }
@@ -346,6 +422,7 @@ void Session::on_wait_timer(boost::beast::error_code ec) {
     abort_wait();
     return;
   }
+  service_->metrics()->increment_fallback_wakeups();
   recheck_now();  // Fallback re-check: covers missed notifications (INV-MUX-05).
 }
 
@@ -356,6 +433,7 @@ void Session::on_wait_wake() {
   if (!pending_wait_ || pending_wait_->settled) {
     return;
   }
+  service_->metrics()->increment_notification_wakeups();
   logger_wait_event("woken");
   recheck_now();
 }
@@ -383,6 +461,7 @@ void Session::settle_wait_timeout() {
   // record, the owner, the lease, and the epoch are all untouched — a later
   // retry re-observes or recovers normally.
   logger_wait_event("timeout");
+  service_->metrics()->increment_waiter_timeouts();
   settle_wait(202, waiter_timeout_body(false));
 }
 
@@ -390,6 +469,7 @@ void Session::abort_wait() {
   if (!pending_wait_) {
     return;
   }
+  service_->metrics()->increment_waiter_aborted();
   if (pending_wait_->waiter_id != 0 && service_ != nullptr) {
     service_->registry()->unregister(pending_wait_->channel, pending_wait_->waiter_id);
   }
@@ -428,10 +508,13 @@ void Session::logger_wait_event(const char* event) {
 }
 
 void Session::send_json(int status, const std::string& body, unsigned version, bool keep_alive,
-                        const std::string& allow) {
+                        const std::string& allow, const std::string& content_type) {
   response_.version(version);
   response_.result(static_cast<http::status>(status));
-  response_.set(http::field::content_type, "application/json");
+  response_.set(http::field::content_type, content_type);
+  if (!correlation_id_.empty()) {
+    response_.set("X-Request-ID", correlation_id_);
+  }
   if (!allow.empty()) {
     response_.set(http::field::allow, allow);
   }

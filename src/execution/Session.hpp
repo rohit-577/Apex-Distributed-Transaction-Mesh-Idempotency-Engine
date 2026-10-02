@@ -72,11 +72,20 @@ class Session : public std::enable_shared_from_this<Session> {
           std::shared_ptr<idempotency::IdempotencyService> service,
           boost::asio::thread_pool* db_pool, observability::Logger& logger);
 
+ public:
+  // Releases any pending waiter registration. Sessions are always
+  // shared_ptr-owned (see launch); destruction only happens after the
+  // response settled or the connection died, so this purely drops the
+  // waiter's registry slot — owner, lease, epoch, and row are untouched
+  // (client cancellation removes only the HTTP waiter).
+  ~Session();
+
   void do_read();
   void on_read(boost::beast::error_code ec);
   void handle_request();
   void handle_ready(boost::beast::http::verb method, unsigned version, bool keep_alive);
   void handle_operations(unsigned version, bool keep_alive);
+  void handle_metrics(unsigned version, bool keep_alive);
   // Phase 3 waiter suspend/resume. All run on the session strand; the pool
   // is only used for service->handle() re-reads.
   void enter_wait(idempotency::OperationRequest request, unsigned version, bool keep_alive);
@@ -91,7 +100,8 @@ class Session : public std::enable_shared_from_this<Session> {
   [[nodiscard]] static std::string waiter_timeout_body(bool shutting_down);
   void logger_wait_event(const char* event);
   void send_json(int status, const std::string& body, unsigned version, bool keep_alive,
-                 const std::string& allow = "");
+                 const std::string& allow = "", const std::string& content_type = "application/json");
+  void count_validation_failure();
   void do_write();
   void do_close();
 
@@ -119,6 +129,9 @@ class Session : public std::enable_shared_from_this<Session> {
   observability::Logger& logger_;
   boost::asio::steady_timer wait_timer_;
   std::optional<PendingWait> pending_wait_;
+  // Per-request correlation ID (operations route only). Echoed back as the
+  // X-Request-ID response header; never part of the fingerprint.
+  std::string correlation_id_;
 };
 
 }  // namespace apex::execution

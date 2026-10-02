@@ -1,7 +1,7 @@
 {
   "name": "apex",
-  "version": "0.4.0",
-  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 3: in-flight multiplexing)",
+  "version": "0.5.0",
+  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 4: resilience hardening)",
   "dependencies": [
     "boost-asio",
     "boost-beast",

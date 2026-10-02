@@ -71,7 +71,8 @@ RecordStatus status_from_string(const std::string& status) {
 }
 
 AcquireResult IdempotencyRepository::try_acquire(PgConnection& db, const std::string& key,
-                                                 const std::string& fingerprint) {
+                                                 const std::string& fingerprint,
+                                                 const std::string& canonical_body) {
   // Transaction 1 (create): the INSERT either establishes our PROCESSING row
   // or — on conflict — establishes nothing. Under concurrency the database
   // decides the winner via the primary key; the loser blocks inside this
@@ -82,11 +83,12 @@ AcquireResult IdempotencyRepository::try_acquire(PgConnection& db, const std::st
   bool committed = false;
   try {
     PgResult inserted = db.exec_params(
-        "INSERT INTO idempotency_records (idempotency_key, fingerprint, status, fencing_epoch)"
-        " VALUES ($1, $2, 'PROCESSING', 1)"
+        "INSERT INTO idempotency_records (idempotency_key, fingerprint, status, fencing_epoch,"
+        " request_body)"
+        " VALUES ($1, $2, 'PROCESSING', 1, $3)"
         " ON CONFLICT (idempotency_key) DO NOTHING"
         " RETURNING idempotency_key, fingerprint, status, fencing_epoch",
-        {key, fingerprint});
+        {key, fingerprint, canonical_body});
     if (inserted.rows() == 1) {
       (void)db.exec("COMMIT");
       committed = true;
@@ -167,6 +169,29 @@ bool IdempotencyRepository::fail(PgConnection& db, const std::string& key,
       " AND fencing_epoch = $5",
       {key, error_code, error_message, fingerprint, std::to_string(epoch)});
   return result.command_tuples() == "1";
+}
+
+std::vector<IdempotencyRepository::OrphanCandidate> IdempotencyRepository::find_orphans(
+    PgConnection& db, int limit, long long idle_longer_than_ms) {
+  // Index-assisted scan (idx_processing_updated_at): only PROCESSING rows,
+  // oldest first, bounded. The cutoff travels as a number, never as
+  // formatted SQL — the statement stays fully parameterized.
+  PgResult result = db.exec_params(
+      "SELECT idempotency_key, fingerprint, request_body FROM idempotency_records"
+      " WHERE status = 'PROCESSING' AND request_body IS NOT NULL"
+      " AND updated_at < now() - ($1::bigint * interval '1 millisecond')"
+      " ORDER BY updated_at LIMIT $2",
+      {std::to_string(idle_longer_than_ms), std::to_string(limit)});
+  std::vector<OrphanCandidate> orphans;
+  orphans.reserve(static_cast<std::size_t>(result.rows()));
+  for (int row = 0; row < result.rows(); ++row) {
+    OrphanCandidate candidate;
+    candidate.key = result.value(row, 0);
+    candidate.fingerprint = result.value(row, 1);
+    candidate.canonical_body = result.value(row, 2);
+    orphans.push_back(std::move(candidate));
+  }
+  return orphans;
 }
 
 std::optional<std::int64_t> IdempotencyRepository::try_recover(PgConnection& db,

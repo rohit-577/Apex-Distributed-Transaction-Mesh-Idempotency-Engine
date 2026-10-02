@@ -13,6 +13,9 @@
 #include <thread>
 #include <vector>
 
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <gtest/gtest.h>
 
 #include "common/pg_fixture.hpp"
@@ -21,6 +24,8 @@
 #include "config/Config.hpp"
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/WaiterRegistry.hpp"
+#include "persistence/IdempotencyRepository.hpp"
+#include "persistence/PgConnection.hpp"
 
 namespace apex {
 namespace {
@@ -305,6 +310,101 @@ TEST_F(PgFixture, MixedFingerprintsExecuteOnlyTheWinner) {
   }
   EXPECT_EQ(bodies_with_200, 1) << "exactly one fingerprint may execute";
   EXPECT_EQ(node.executor->executions(), 1u) << "conflicts must not execute (INV-MUX-09)";
+}
+
+TEST_F(PgFixture, DisconnectedWaitersChangeNothingDurable) {
+  // Cancellation: 1 gated owner + 50 waiting clients + 50 clients that
+  // connect, send, and vanish mid-wait. Disconnecting removes only the HTTP
+  // waiter — never the owner, lease, epoch, or row. The surviving 50 get the
+  // identical final result from exactly one execution, and the registry ends
+  // empty (sessions release their slots on death).
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  NodeBundle node = make_node(/*gate_open=*/false);
+  GateOpener guard(*node.executor);
+  test::TestServer server(mux_config(), node.service);
+  const std::string key = unique_key("mux-cancel");
+  const std::string body = R"({"mux":"cancel"})";
+  const std::string channel = channel_of(key, body);
+
+  int owner_status = 0;
+  std::string owner_body;
+  std::thread owner([&] {
+    const test::HttpResult result = post_key(server.port(), key, body);
+    owner_status = result.status;
+    owner_body = result.body;
+  });
+  ASSERT_TRUE(wait_until([&] { return node.executor->executions() == 1; }));
+
+  // 50 well-behaved waiters, all suspended before the chaos half starts
+  // (count==50 exactly: nothing else has been sent yet).
+  constexpr int kKeepers = 50;
+  std::vector<int> keeper_statuses(kKeepers, 0);
+  std::vector<std::string> keeper_bodies(kKeepers);
+  std::vector<std::thread> keepers;
+  for (int i = 0; i < kKeepers; ++i) {
+    keepers.emplace_back([&, i] {
+      const test::HttpResult result = post_key(server.port(), key, body);
+      keeper_statuses[i] = result.status;
+      keeper_bodies[i] = result.body;
+    });
+  }
+  ASSERT_TRUE(wait_until([&] {
+    return node.registry->waiter_count(channel) == static_cast<std::size_t>(kKeepers);
+  })) << "keepers never all suspended";
+
+  // 50 abrupt disconnects: full request bytes, then close without reading.
+  // Raw sockets (not the shared helper) because the helper always reads.
+  constexpr int kDroppers = 50;
+  std::vector<std::thread> droppers;
+  for (int i = 0; i < kDroppers; ++i) {
+    droppers.emplace_back([&] {
+      try {
+        namespace asio = boost::asio;
+        namespace beast = boost::beast;
+        namespace http = beast::http;
+        asio::io_context ioc;
+        asio::ip::tcp::socket socket(ioc);
+        socket.connect({asio::ip::make_address("127.0.0.1"), server.port()});
+        http::request<http::string_body> req{http::verb::post, "/v1/operations", 11};
+        req.set(http::field::host, "127.0.0.1");
+        req.set("Idempotency-Key", key);
+        req.set(http::field::content_type, "application/json");
+        req.body() = body;
+        req.prepare_payload();
+        http::write(socket, req);
+        boost::system::error_code ec;
+        socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket.close(ec);
+      } catch (const std::exception&) {
+      }
+    });
+  }
+  for (std::thread& t : droppers) {
+    t.join();
+  }
+
+  node.executor->open_gate();
+  owner.join();
+  for (std::thread& t : keepers) {
+    t.join();
+  }
+
+  EXPECT_EQ(owner_status, 200);
+  for (int i = 0; i < kKeepers; ++i) {
+    EXPECT_EQ(keeper_statuses[i], 200) << "keeper " << i;
+    EXPECT_EQ(keeper_bodies[i], owner_body) << "keeper " << i << " diverged";
+  }
+  EXPECT_EQ(node.executor->executions(), 1u) << "one execution despite 101 contenders";
+  {
+    auto db = raw_connect();
+    const auto record = repo().find_by_key(*db, key);
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->status, persistence::RecordStatus::Completed);
+    EXPECT_EQ(record->fencing_epoch, 1);
+  }
+  EXPECT_TRUE(wait_until([&] { return node.registry->waiter_count(channel) == 0; }))
+      << "dead-client slots leaked";
 }
 
 }  // namespace

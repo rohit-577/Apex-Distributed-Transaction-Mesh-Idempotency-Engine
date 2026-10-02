@@ -78,6 +78,16 @@ WaiterRegistry::Registration WaiterRegistry::register_waiter(const std::string& 
   Shard& shard = shard_for(key);
   std::lock_guard<std::mutex> lock(shard.mutex);
   Slot& slot = shard.slots[key];  // Creates on first waiter; erased on notify.
+  // Prune dead owners first: abruptly disconnected sessions release via
+  // ~Session, but a crashed path that skips it must not let corpses consume
+  // the per-key cap (DoS bound stays meaningful under client churn).
+  for (auto it = slot.waiters.begin(); it != slot.waiters.end();) {
+    if (it->second.owner.expired()) {
+      it = slot.waiters.erase(it);
+    } else {
+      ++it;
+    }
+  }
   if (slot.waiters.size() >= options_.max_waiters_per_key) {
     receipt.rejected = true;
     return receipt;

@@ -3,14 +3,16 @@
 // Startup sequence: load config -> log warnings -> validate (exit 2 on
 // failure) -> build the database pool + idempotency service (lazy: a dead
 // database degrades to 503s, not a refusal to boot) -> best-effort schema
-// ensure -> bind/listen (exit 1 with a message on failure) -> run the I/O
-// thread pool -> graceful shutdown on SIGINT/SIGTERM.
+// ensure -> start subscriber + orphan reaper -> bind/listen (exit 1 with a
+// message on failure) -> run the I/O thread pool -> graceful shutdown on
+// SIGINT/SIGTERM.
 //
 // Shutdown sequence: stop the acceptor (no new connections) -> stop the
-// io_context -> join I/O workers -> join database workers -> close the pool.
-// Every stage outlives its users: sessions finish before the ioc dies, and
-// pool guards finish before the pool closes. Exit codes: 0 clean,
-// 1 runtime failure, 2 invalid configuration.
+// reaper (no new recovery passes) -> registry shutdown (active waits get
+// 202 while the loop runs) -> stop the subscriber -> stop the io_context
+// -> join I/O workers -> join database workers -> close the pools.
+// Every stage outlives its users. Exit codes: 0 clean, 1 runtime failure,
+// 2 invalid configuration.
 
 #include <csignal>
 #include <chrono>
@@ -33,11 +35,27 @@
 #include "idempotency/OperationExecutor.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/PgConnection.hpp"
 #include "persistence/Schema.hpp"
+#include "recovery/OrphanReaper.hpp"
+
+#if defined(_WIN32)
+#include <Windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
+
+unsigned long current_process_id() {
+#if defined(_WIN32)
+  return static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+  return static_cast<unsigned long>(::getpid());
+#endif
+}
 
 int run() {
   using apex::config::Config;
@@ -56,6 +74,24 @@ int run() {
     return 2;
   }
 
+  // Operational identity + effective configuration, one line, no secrets.
+  // Everything here is safe to ship to centralized logs (ports, sizes,
+  // durations — never passwords, bodies, or keys).
+  const std::string node_id =
+      config.node_id.empty() ? "pid-" + std::to_string(current_process_id()) : config.node_id;
+  logger.info("apex node=" + node_id + " config: port=" + std::to_string(config.port) +
+              " threads=" + std::to_string(config.threads) + " db_pool=" +
+              std::to_string(config.db_pool_size) + " redis_pool=" +
+              std::to_string(config.redis_pool_size) + " lease_ttl_ms=" +
+              std::to_string(config.lease_ttl_ms) + " redis_timeout_ms=" +
+              std::to_string(config.redis_op_timeout_ms) + " waiter_timeout_ms=" +
+              std::to_string(config.waiter_timeout_ms) + " waiter_recheck_ms=" +
+              std::to_string(config.waiter_recheck_ms) + " max_waiters_per_key=" +
+              std::to_string(config.max_waiters_per_key) + " reaper_interval_ms=" +
+              std::to_string(config.reaper_interval_ms) + " reaper_batch=" +
+              std::to_string(config.reaper_batch_size) + " reaper_eligible_after_ms=" +
+              std::to_string(config.reaper_eligible_after_ms));
+
   boost::asio::io_context ioc{static_cast<int>(config.threads)};
 
   // Durable idempotency wiring. The pool opens connections lazily (see
@@ -64,6 +100,9 @@ int run() {
   // /health and /ready keep their Phase 0 behavior regardless.
   auto pool = std::make_shared<apex::persistence::ConnectionPool>(config.postgres_conninfo(),
                                                                   config.db_pool_size);
+
+  // Process metrics (always on; atomics are cheap, cardinality is fixed).
+  auto metrics = std::make_shared<apex::observability::Metrics>();
 
   // Lease coordination (single Redis instance — NOT Redlock, documented in
   // docs/lease-and-fencing.md). redis-plus-plus connects lazily, so this
@@ -79,7 +118,7 @@ int run() {
   auto redis =
       std::make_shared<apex::coordination::RedisClient>(std::move(redis_endpoint));
   auto leases = std::make_shared<apex::coordination::LeaseManager>(
-      redis, std::chrono::milliseconds(config.lease_ttl_ms), logger);
+      redis, std::chrono::milliseconds(config.lease_ttl_ms), logger, metrics);
 
   auto service_deps = apex::idempotency::ServiceDependencies{};
   service_deps.pool = pool;
@@ -90,6 +129,7 @@ int run() {
           static_cast<long long>(config.waiter_timeout_ms),
           static_cast<long long>(config.waiter_recheck_ms), config.max_waiters_per_key});
   service_deps.redis = redis;
+  service_deps.metrics = metrics;
   auto service =
       std::make_shared<apex::idempotency::IdempotencyService>(std::move(service_deps), logger);
   boost::asio::thread_pool db_pool(config.db_pool_size);
@@ -110,8 +150,18 @@ int run() {
   // Cross-node waiter wake-ups (best-effort pub/sub; correctness never
   // depends on it). Started after the schema ensure so its thread never
   // outlives the registry it dispatches to (stopped explicitly below).
-  apex::coordination::CompletionSubscriber subscriber(redis, *service->registry(), logger);
+  apex::coordination::CompletionSubscriber subscriber(redis, *service->registry(), logger,
+                                                        metrics);
   subscriber.start();
+
+  // Background orphan recovery (traffic-independent adoption via the same
+  // service path live requests use — no second ownership mechanism).
+  apex::recovery::ReaperOptions reaper_options;
+  reaper_options.interval_ms = static_cast<long long>(config.reaper_interval_ms);
+  reaper_options.batch_size = static_cast<int>(config.reaper_batch_size);
+  reaper_options.eligible_after_ms = static_cast<long long>(config.reaper_eligible_after_ms);
+  apex::recovery::OrphanReaper reaper(service, pool, logger, reaper_options, metrics);
+  reaper.start();
 
   HttpServer server(ioc, config, APEX_VERSION, APEX_PHASE, service, &db_pool, logger);
   server.start();
@@ -127,9 +177,10 @@ int run() {
   signals.async_wait([&](const boost::system::error_code&, int /*signal*/) {
     logger.info("shutdown signal received; draining connections");
     server.stop();
-    // Wake waiters with 202 while the loop still runs (their deferred
-    // responses need a live io_context), then stop the subscriber thread
-    // before anything it touches can die.
+    // Deterministic shutdown order: no new requests, no new recovery
+    // passes, then wake waiters (202 while the loop runs), then stop the
+    // subscriber, then stop the loop. Every stage outlives its users.
+    reaper.stop();
     service->registry()->shutdown();
     subscriber.stop();
     ioc.stop();

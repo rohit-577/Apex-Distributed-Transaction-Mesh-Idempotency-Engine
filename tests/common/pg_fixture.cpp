@@ -11,6 +11,7 @@
 #include "idempotency/OperationExecutor.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/PgConnection.hpp"
 #include "persistence/Schema.hpp"
@@ -31,6 +32,7 @@ std::shared_ptr<coordination::LeaseManager> PgFixture::s_leases;
 std::shared_ptr<idempotency::WaiterRegistry> PgFixture::s_registry;
 std::shared_ptr<idempotency::OperationExecutor> PgFixture::s_executor;
 std::shared_ptr<coordination::CompletionSubscriber> PgFixture::s_subscriber;
+std::shared_ptr<observability::Metrics> PgFixture::s_metrics;
 
 idempotency::WaiterOptions PgFixture::test_waiter_options() {
   // Fast tests, honest semantics: short fallback interval exercises the
@@ -63,6 +65,7 @@ void PgFixture::SetUpTestSuite() {
   persistence::Schema::ensure(bootstrap, APEX_MIGRATIONS_DIR);
   s_logger = std::make_unique<observability::Logger>(observability::Level::Warning);
   s_pool = std::make_shared<persistence::ConnectionPool>(*s_conninfo, /*max_size=*/16);
+  s_metrics = std::make_shared<observability::Metrics>();
   if (s_redis_host) {
     // Short timeouts in tests: a dead Redis must fail fast, never stall the
     // suite. Generous 10 s lease TTL mirrors production default.
@@ -74,7 +77,7 @@ void PgFixture::SetUpTestSuite() {
     endpoint.pool_size = 32;
     s_redis = std::make_shared<coordination::RedisClient>(std::move(endpoint));
     s_leases = std::make_shared<coordination::LeaseManager>(
-        s_redis, std::chrono::milliseconds(10000), *s_logger);
+        s_redis, std::chrono::milliseconds(10000), *s_logger, s_metrics);
   }
   s_registry = std::make_shared<idempotency::WaiterRegistry>(test_waiter_options());
   s_executor = std::make_shared<idempotency::SimulatedExecutor>();
@@ -84,11 +87,12 @@ void PgFixture::SetUpTestSuite() {
   deps.executor = s_executor;
   deps.registry = s_registry;
   deps.redis = s_redis;
+  deps.metrics = s_metrics;
   s_service = std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
   // Stopped until a test explicitly needs cross-node wake-up. Same-process
   // waiting works through the local registry without it.
   s_subscriber = std::make_shared<coordination::CompletionSubscriber>(s_redis, *s_registry,
-                                                                      *s_logger);
+                                                                      *s_logger, s_metrics);
 }
 
 PgFixture::NodeBundle::~NodeBundle() {
@@ -112,10 +116,11 @@ PgFixture::NodeBundle PgFixture::make_node_with_executor(
   deps.executor = node.executor;
   deps.registry = node.registry;
   deps.redis = s_redis;
+  deps.metrics = s_metrics;
   node.service =
       std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
   node.subscriber = std::make_shared<coordination::CompletionSubscriber>(
-      s_redis, *node.registry, *s_logger);
+      s_redis, *node.registry, *s_logger, s_metrics);
   return node;
 }
 
@@ -130,10 +135,11 @@ PgFixture::NodeBundle PgFixture::make_node_with_options(
   deps.executor = node.executor;
   deps.registry = node.registry;
   deps.redis = s_redis;
+  deps.metrics = s_metrics;
   node.service =
       std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
   node.subscriber = std::make_shared<coordination::CompletionSubscriber>(
-      s_redis, *node.registry, *s_logger);
+      s_redis, *node.registry, *s_logger, s_metrics);
   return node;
 }
 
@@ -153,6 +159,7 @@ std::shared_ptr<idempotency::IdempotencyService> PgFixture::make_service(
                       ? std::move(registry)
                       : std::make_shared<idempotency::WaiterRegistry>(test_waiter_options());
   deps.redis = redis != nullptr ? std::move(redis) : s_redis;
+  deps.metrics = s_metrics;
   return std::make_shared<idempotency::IdempotencyService>(std::move(deps), logger);
 }
 

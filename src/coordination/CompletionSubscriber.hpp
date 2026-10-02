@@ -20,12 +20,14 @@
 // shutdown never hangs on Pub/Sub (P3-18 proves it).
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
 
 namespace apex::observability {
 class Logger;
+class Metrics;
 }
 
 namespace apex::idempotency {
@@ -42,7 +44,8 @@ class CompletionSubscriber {
   // subscriber shares the process RedisClient (dedicated connection taken
   // internally); it never issues commands on pooled connections.
   CompletionSubscriber(std::shared_ptr<RedisClient> redis,
-                       idempotency::WaiterRegistry& registry, observability::Logger& logger);
+                       idempotency::WaiterRegistry& registry, observability::Logger& logger,
+                       std::shared_ptr<observability::Metrics> metrics);
 
   CompletionSubscriber(const CompletionSubscriber&) = delete;
   CompletionSubscriber& operator=(const CompletionSubscriber&) = delete;
@@ -55,15 +58,22 @@ class CompletionSubscriber {
   // the socket read timeout. Must precede destruction of the registry.
   void stop();
 
+  // Number of (re)subscription cycles completed. Used by reconnect tests
+  // (state-gated, never timing): a disconnect followed by recovery shows up
+  // here before any waiter converges through the fresh subscription.
+  [[nodiscard]] std::uint64_t reconnect_count() const { return reconnects_.load(); }
+
  private:
   void run();
 
   std::shared_ptr<RedisClient> redis_;
   idempotency::WaiterRegistry& registry_;
   observability::Logger& logger_;
+  std::shared_ptr<observability::Metrics> metrics_;
   std::thread thread_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> started_{false};
+  std::atomic<std::uint64_t> reconnects_{0};
 };
 
 }  // namespace apex::coordination

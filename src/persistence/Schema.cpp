@@ -33,7 +33,8 @@ void Schema::apply(PgConnection& db, const std::string& sql) {
 void Schema::ensure(PgConnection& db, const std::string& dir) {
   // Ordered, append-only. Each file is individually idempotent; the sequence
   // is therefore idempotent too.
-  constexpr std::array<const char*, 2> kOrdered = {kMigrationV001, kMigrationV002};
+  constexpr std::array<const char*, 3> kOrdered = {kMigrationV001, kMigrationV002,
+                                                   kMigrationV003};
   for (const char* file : kOrdered) {
     apply(db, read_migration_file(dir, file));
   }

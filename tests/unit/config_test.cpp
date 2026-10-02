@@ -264,5 +264,78 @@ TEST(ConfigTest, InvalidWaiterEnvironmentFallsBackWithWarnings) {
   EXPECT_TRUE(cfg.validate().empty());
 }
 
+TEST(ConfigTest, ReaperDefaultsAreValid) {
+  const Config cfg = Config::defaults();
+  EXPECT_EQ(cfg.reaper_interval_ms, 30000u);
+  EXPECT_EQ(cfg.reaper_batch_size, 10u);
+  EXPECT_EQ(cfg.reaper_eligible_after_ms, 30000u);
+  EXPECT_TRUE(cfg.validate().empty()) << cfg.validate();
+}
+
+TEST(ConfigTest, ReaperBoundsAreEnforced) {
+  for (unsigned bad : {0u, 999u, 600001u}) {
+    Config cfg = Config::defaults();
+    cfg.reaper_interval_ms = bad;
+    EXPECT_FALSE(cfg.validate().empty()) << bad;
+  }
+  for (unsigned bad : {0u, 1001u}) {
+    Config cfg = Config::defaults();
+    cfg.reaper_batch_size = bad;
+    EXPECT_FALSE(cfg.validate().empty()) << bad;
+  }
+  for (unsigned bad : {0u, 999u, 3600001u}) {
+    Config cfg = Config::defaults();
+    cfg.reaper_eligible_after_ms = bad;
+    EXPECT_FALSE(cfg.validate().empty()) << bad;
+  }
+}
+
+TEST(ConfigTest, ReaperEnvironmentOverridesAreHonored) {
+  test::EnvGuard interval("APEX_REAPER_INTERVAL_MS", "5000");
+  test::EnvGuard batch("APEX_REAPER_BATCH_SIZE", "25");
+  test::EnvGuard eligible("APEX_REAPER_ELIGIBLE_AFTER_MS", "60000");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_TRUE(warnings.empty());
+  EXPECT_EQ(cfg.reaper_interval_ms, 5000u);
+  EXPECT_EQ(cfg.reaper_batch_size, 25u);
+  EXPECT_EQ(cfg.reaper_eligible_after_ms, 60000u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
+TEST(ConfigTest, InvalidReaperEnvironmentFallsBackWithWarnings) {
+  test::EnvGuard interval("APEX_REAPER_INTERVAL_MS", "soon");
+  test::EnvGuard batch("APEX_REAPER_BATCH_SIZE", "0");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_EQ(cfg.reaper_interval_ms, 30000u);
+  EXPECT_EQ(cfg.reaper_batch_size, 10u);
+  EXPECT_EQ(warnings.size(), 2u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
+TEST(ConfigTest, NodeIdDefaultsEmptyAndValidatesLength) {
+  const Config cfg = Config::defaults();
+  EXPECT_TRUE(cfg.node_id.empty());
+  EXPECT_TRUE(cfg.validate().empty()) << cfg.validate();
+
+  Config long_id = Config::defaults();
+  long_id.node_id = std::string(65, 'n');
+  EXPECT_FALSE(long_id.validate().empty());
+
+  Config ok_id = Config::defaults();
+  ok_id.node_id = "gateway-eu-1";
+  EXPECT_TRUE(ok_id.validate().empty());
+}
+
+TEST(ConfigTest, NodeIdEnvironmentOverrideIsHonored) {
+  test::EnvGuard node("APEX_NODE_ID", "gateway-eu-1");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_TRUE(warnings.empty());
+  EXPECT_EQ(cfg.node_id, "gateway-eu-1");
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
 }  // namespace
 }  // namespace apex::config

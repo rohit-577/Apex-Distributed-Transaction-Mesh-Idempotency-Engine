@@ -22,8 +22,9 @@ class Schema {
   // applied migration in place — new changes get a new file.
   static constexpr const char* kMigrationV001 = "V001__idempotency_records.sql";
   static constexpr const char* kMigrationV002 = "V002__fencing_epoch.sql";
+  static constexpr const char* kMigrationV003 = "V003__recovery_support.sql";
   // Kept for log lines that name the latest migration.
-  static constexpr const char* kMigrationFile = kMigrationV002;
+  static constexpr const char* kMigrationFile = kMigrationV003;
 
   // Reads <dir>/<file>. Throws PgError when missing/unreadable/empty (fail
   // fast: running without the schema turns every request into a 503).

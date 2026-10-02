@@ -14,6 +14,7 @@
 #include "coordination/RedisClient.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 
 namespace apex::coordination {
 namespace {
@@ -25,7 +26,8 @@ TEST_F(PgFixture, SubscriberSpikeDeliveryAndStop) {
   REQUIRE_REDIS();
   apex::idempotency::WaiterRegistry registry;
   apex::observability::Logger quiet(apex::observability::Level::Error);
-  CompletionSubscriber sub(test::PgFixture::shared_redis_client(), registry, quiet);
+  auto metrics = std::make_shared<apex::observability::Metrics>();
+  CompletionSubscriber sub(test::PgFixture::shared_redis_client(), registry, quiet, metrics);
   sub.start();
 
   const std::string channel =

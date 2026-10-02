@@ -39,6 +39,7 @@ class CompletionSubscriber;
 
 namespace apex::observability {
 class Logger;
+class Metrics;
 }
 
 namespace apex::idempotency {
@@ -125,6 +126,7 @@ class PgFixture : public ::testing::Test {
   static std::shared_ptr<idempotency::WaiterRegistry> s_registry;
   static std::shared_ptr<idempotency::OperationExecutor> s_executor;
   static std::shared_ptr<coordination::CompletionSubscriber> s_subscriber;
+  static std::shared_ptr<observability::Metrics> s_metrics;
 
  protected:
   // Shared service for HTTP-level tests (wired into TestServer).
@@ -132,6 +134,7 @@ class PgFixture : public ::testing::Test {
   static std::shared_ptr<persistence::ConnectionPool> shared_pool() { return s_pool; }
   static std::shared_ptr<coordination::LeaseManager> shared_leases() { return s_leases; }
   static std::shared_ptr<coordination::RedisClient> shared_redis_client() { return s_redis; }
+  static std::shared_ptr<observability::Metrics> shared_metrics() { return s_metrics; }
   static std::shared_ptr<idempotency::WaiterRegistry> shared_registry() { return s_registry; }
   // Shared (stopped) subscriber for tests that need cross-node wake-up on
   // the shared registry. Start explicitly; most tests leave it stopped

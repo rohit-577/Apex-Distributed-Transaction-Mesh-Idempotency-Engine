@@ -4,6 +4,7 @@
 
 #include "coordination/RedisClient.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 
 namespace apex::coordination {
 
@@ -25,8 +26,9 @@ std::string to_hex(const unsigned char* bytes, std::size_t count) {
 }  // namespace
 
 LeaseManager::LeaseManager(std::shared_ptr<RedisClient> redis, std::chrono::milliseconds ttl,
-                           observability::Logger& logger)
-    : redis_(std::move(redis)), ttl_(ttl), logger_(logger) {}
+                           observability::Logger& logger,
+                           std::shared_ptr<observability::Metrics> metrics)
+    : redis_(std::move(redis)), ttl_(ttl), logger_(logger), metrics_(std::move(metrics)) {}
 
 std::string LeaseManager::lease_key_for(const std::string& idempotency_key) {
   return std::string(kLeasePrefix) + idempotency_key;
@@ -59,18 +61,26 @@ LeaseAttempt LeaseManager::try_acquire(const std::string& idempotency_key) {
   try {
     if (redis_->set_if_absent(key, token, ttl_)) {
       logger_.info("lease key=" + logged + " acquired ttl_ms=" + std::to_string(ttl_.count()));
+      metrics_->increment_lease_acquired();
       return {LeaseAttempt::Result::Acquired, token};
     }
     logger_.info("lease key=" + logged + " held-by-other");
+    metrics_->increment_lease_held();
     return {LeaseAttempt::Result::HeldByOther, ""};
   } catch (const RedisError& e) {
     logger_.error("lease key=" + logged + " acquire failed (Redis unavailable): " + e.what());
+    metrics_->increment_redis_failures();
     return {LeaseAttempt::Result::RedisUnavailable, ""};
   }
 }
 
 bool LeaseManager::is_held(const std::string& idempotency_key) {
-  return redis_->get(lease_key_for(idempotency_key)).has_value();
+  try {
+    return redis_->get(lease_key_for(idempotency_key)).has_value();
+  } catch (const RedisError&) {
+    metrics_->increment_redis_failures();
+    throw;
+  }
 }
 
 bool LeaseManager::release(const std::string& idempotency_key, const std::string& token) {
@@ -83,15 +93,18 @@ bool LeaseManager::release(const std::string& idempotency_key, const std::string
         redis_->compare_and_delete(lease_key_for(idempotency_key), token) == 1;
     if (released) {
       logger_.info("lease key=" + logged + " released");
+      metrics_->increment_lease_releases();
     } else {
       // Expired, recovered by a newer owner, or never ours: the TTL owns
       // cleanup from here. This is EXPECTED on the stale-owner path, not an
       // error — hence info, and hence no retry.
       logger_.info("lease key=" + logged + " release rejected (token mismatch)");
+      metrics_->increment_lease_release_rejected();
     }
     return released;
   } catch (const RedisError& e) {
     logger_.error("lease key=" + logged + " release failed (Redis unavailable): " + e.what());
+    metrics_->increment_redis_failures();
     return false;
   }
 }

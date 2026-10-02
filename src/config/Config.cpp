@@ -46,6 +46,10 @@ constexpr const char* kRedisTimeoutEnv = "APEX_REDIS_OP_TIMEOUT_MS";
 constexpr const char* kWaiterTimeoutEnv = "APEX_WAITER_TIMEOUT_MS";
 constexpr const char* kWaiterRecheckEnv = "APEX_WAITER_RECHECK_MS";
 constexpr const char* kMaxWaitersEnv = "APEX_MAX_WAITERS_PER_KEY";
+constexpr const char* kReaperIntervalEnv = "APEX_REAPER_INTERVAL_MS";
+constexpr const char* kReaperBatchEnv = "APEX_REAPER_BATCH_SIZE";
+constexpr const char* kReaperEligibleEnv = "APEX_REAPER_ELIGIBLE_AFTER_MS";
+constexpr const char* kNodeIdEnv = "APEX_NODE_ID";
 constexpr const char* kLogLevelEnv = "APEX_LOG_LEVEL";
 
 constexpr unsigned kMaxThreads = 256;
@@ -67,6 +71,14 @@ constexpr unsigned kMaxWaiterTimeoutMs = 300000;
 constexpr unsigned kMinWaiterRecheckMs = 100;
 constexpr unsigned kMaxWaiterRecheckMs = 30000;
 constexpr unsigned kMaxWaitersPerKey = 100000;
+// Reaper bounds (see OrphanReaper): interval and eligibility are scheduling
+// hints, batch caps one pass's pressure. Eligible-after ceiling (1 h) keeps
+// orphans from waiting absurdly long when misconfigured.
+constexpr unsigned kMinReaperIntervalMs = 1000;
+constexpr unsigned kMaxReaperIntervalMs = 600000;
+constexpr unsigned kMaxReaperBatch = 1000;
+constexpr unsigned kMinReaperEligibleMs = 1000;
+constexpr unsigned kMaxReaperEligibleMs = 3600000;
 
 bool parse_port(const char* text, std::uint16_t& out) {
   if (text == nullptr || *text == '\0') {
@@ -239,6 +251,40 @@ std::pair<Config, std::vector<std::string>> Config::load_from_environment() {
       cfg.max_waiters_per_key = 1024;
     }
   }
+  if (const auto v = get_env(kReaperIntervalEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.reaper_interval_ms, kMinReaperIntervalMs,
+                         kMaxReaperIntervalMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kReaperIntervalEnv +
+                            "; using default 30000.");
+      cfg.reaper_interval_ms = 30000;
+    }
+  }
+  if (const auto v = get_env(kReaperBatchEnv); v && !v->empty()) {
+    if (!parse_bounded_count(v->c_str(), cfg.reaper_batch_size, kMaxReaperBatch)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kReaperBatchEnv +
+                            "; using default 10.");
+      cfg.reaper_batch_size = 10;
+    }
+  }
+  if (const auto v = get_env(kReaperEligibleEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.reaper_eligible_after_ms, kMinReaperEligibleMs,
+                         kMaxReaperEligibleMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kReaperEligibleEnv +
+                            "; using default 30000.");
+      cfg.reaper_eligible_after_ms = 30000;
+    }
+  }
+  // Node ID is an opaque operational label, not a secret and not a decision
+  // input: accept anything short, reject only absurd lengths.
+  if (const auto v = get_env(kNodeIdEnv); v && !v->empty()) {
+    if (v->size() > 64) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kNodeIdEnv +
+                            "; using default.");
+      cfg.node_id.clear();
+    } else {
+      cfg.node_id = *v;
+    }
+  }
   if (const auto v = get_env(kLogLevelEnv); v && !v->empty()) {
     cfg.log_level = *v;
   }
@@ -288,6 +334,19 @@ std::string Config::validate() const {
   }
   if (max_waiters_per_key < 1 || max_waiters_per_key > kMaxWaitersPerKey) {
     return "max_waiters_per_key must be in [1, 100000]";
+  }
+  if (reaper_interval_ms < kMinReaperIntervalMs || reaper_interval_ms > kMaxReaperIntervalMs) {
+    return "reaper_interval_ms must be in [1000, 600000]";
+  }
+  if (reaper_batch_size < 1 || reaper_batch_size > kMaxReaperBatch) {
+    return "reaper_batch_size must be in [1, 1000]";
+  }
+  if (reaper_eligible_after_ms < kMinReaperEligibleMs ||
+      reaper_eligible_after_ms > kMaxReaperEligibleMs) {
+    return "reaper_eligible_after_ms must be in [1000, 3600000]";
+  }
+  if (node_id.size() > 64) {
+    return "node_id must be at most 64 characters";
   }
   if (log_level != "debug" && log_level != "info" && log_level != "warning" &&
       log_level != "error") {

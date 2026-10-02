@@ -31,7 +31,7 @@ TEST_F(PgFixture, AcquireCreatesProcessingAndFindRoundTrips) {
   const std::string key = unique_key("acquire");
   auto db = raw_connect();
 
-  const AcquireResult created = repo().try_acquire(*db, key, kFpA);
+  const AcquireResult created = repo().try_acquire(*db, key, kFpA, R"({})");
   EXPECT_EQ(created.outcome, AcquireOutcome::Created);
   EXPECT_EQ(created.record.status, RecordStatus::Processing);
 
@@ -48,8 +48,8 @@ TEST_F(PgFixture, SecondAcquireFindsTheSameRow) {
   const std::string key = unique_key("reacquire");
   auto db = raw_connect();
 
-  EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
-  const AcquireResult second = repo().try_acquire(*db, key, kFpA);
+  EXPECT_EQ(repo().try_acquire(*db, key, kFpA, R"({})").outcome, AcquireOutcome::Created);
+  const AcquireResult second = repo().try_acquire(*db, key, kFpA, R"({})");
   EXPECT_EQ(second.outcome, AcquireOutcome::Found);
   EXPECT_EQ(second.record.key, key);
   EXPECT_EQ(second.record.status, RecordStatus::Processing);
@@ -65,7 +65,7 @@ TEST_F(PgFixture, CompleteStoresReplayableResponse) {
   REQUIRE_PG();
   const std::string key = unique_key("complete");
   auto db = raw_connect();
-  EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
+  EXPECT_EQ(repo().try_acquire(*db, key, kFpA, R"({})").outcome, AcquireOutcome::Created);
 
   EXPECT_TRUE(repo().complete(*db, key, kFpA, 1, 200, R"({"result":"ok"})", "application/json"));
 
@@ -85,7 +85,7 @@ TEST_F(PgFixture, TerminalWritesAreIdempotentGuards) {
   REQUIRE_PG();
   const std::string key = unique_key("terminal");
   auto db = raw_connect();
-  EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
+  EXPECT_EQ(repo().try_acquire(*db, key, kFpA, R"({})").outcome, AcquireOutcome::Created);
   ASSERT_TRUE(repo().complete(*db, key, kFpA, 1, 200, "first", "application/json"));
 
   EXPECT_FALSE(repo().complete(*db, key, kFpA, 1, 200, "second", "application/json"));
@@ -101,7 +101,7 @@ TEST_F(PgFixture, FailTransitionAndFailedIsTerminal) {
   REQUIRE_PG();
   const std::string key = unique_key("fail");
   auto db = raw_connect();
-  EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
+  EXPECT_EQ(repo().try_acquire(*db, key, kFpA, R"({})").outcome, AcquireOutcome::Created);
 
   EXPECT_TRUE(repo().fail(*db, key, kFpA, 1, "simulated_failure", "asked to fail"));
   EXPECT_FALSE(repo().fail(*db, key, kFpA, 1, "again", "again"));
@@ -119,7 +119,7 @@ TEST_F(PgFixture, TerminalWriteWithWrongFingerprintAffectsZeroRows) {
   REQUIRE_PG();
   const std::string key = unique_key("fpguard");
   auto db = raw_connect();
-  EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
+  EXPECT_EQ(repo().try_acquire(*db, key, kFpA, R"({})").outcome, AcquireOutcome::Created);
 
   EXPECT_FALSE(repo().complete(*db, key, kFpB, 1, 200, "wrong", "application/json"));
   EXPECT_EQ(repo().find_by_key(*db, key)->status, RecordStatus::Processing);
@@ -240,7 +240,7 @@ TEST_F(PgFixture, PoolRecyclesConnectionsAcrossCheckouts) {
   const std::string key = unique_key("pool");
   {
     persistence::ConnectionPool::Guard first = pool().acquire();
-    EXPECT_EQ(repo().try_acquire(first.connection(), key, kFpA).outcome,
+    EXPECT_EQ(repo().try_acquire(first.connection(), key, kFpA, R"({})").outcome,
               AcquireOutcome::Created);
   }  // Guard returns the connection here.
   {

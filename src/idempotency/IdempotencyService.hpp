@@ -52,6 +52,7 @@
 
 namespace apex::observability {
 class Logger;
+class Metrics;
 }
 
 namespace apex::persistence {
@@ -75,6 +76,9 @@ struct OperationRequest {
   std::string key;
   std::string fingerprint;
   std::string canonical_body;
+  // Fresh per HTTP attempt (never part of the fingerprint). Follows the
+  // request through logs so concurrent duplicates stay distinguishable.
+  std::string correlation_id;
 };
 
 struct OperationOutcome {
@@ -107,6 +111,8 @@ struct ServiceDependencies {
   // client in production; BEST-EFFORT — publish failure never fails the
   // already-committed operation).
   std::shared_ptr<coordination::RedisClient> redis;
+  // Required: every outcome maps to exactly one counter (see handle()).
+  std::shared_ptr<observability::Metrics> metrics;
 };
 
 class IdempotencyService {
@@ -116,13 +122,19 @@ class IdempotencyService {
   // BLOCKING: performs lease + repository transactions and the operation
   // on the caller's thread. Never throws: every failure maps to an outcome
   // (worker threads must never see an exception). Never WAITS: an owned
-  // operation elsewhere yields Wait for the caller to suspend on.
+  // operation elsewhere yields Wait for the caller to suspend on. Every
+  // returned outcome maps to exactly one process counter (see count_outcome).
   [[nodiscard]] OperationOutcome handle(const OperationRequest& request);
 
   // Shared waiter registry (Session drives async waiting through it).
   [[nodiscard]] std::shared_ptr<WaiterRegistry> registry() const { return deps_.registry; }
+  // Shared process metrics (Session counts waiter lifecycle events here).
+  [[nodiscard]] std::shared_ptr<observability::Metrics> metrics() const { return deps_.metrics; }
 
  private:
+  // The decision engine (see handle()). Separated so handle() stays a thin
+  // counting wrapper with exactly one increment site per outcome kind.
+  [[nodiscard]] OperationOutcome handle_inner(const OperationRequest& request);
   // CASE A: no durable row. Wins the Redis lease, then creates epoch 1 —
   // or fails closed (503) / defers (202) without creating anything.
   OperationOutcome handle_first_request(persistence::PgConnection& db,

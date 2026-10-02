@@ -16,6 +16,7 @@
 #include "coordination/LeaseManager.hpp"
 #include "coordination/RedisClient.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 
 namespace apex::coordination {
 namespace {
@@ -135,7 +136,8 @@ TEST(RedisOutageTest, LeaseOperationsFailClosedWithoutInfrastructure) {
   endpoint.pool_size = 1;
   auto dead_client = std::make_shared<RedisClient>(std::move(endpoint));
   apex::observability::Logger quiet(apex::observability::Level::Error);
-  LeaseManager dead_leases(dead_client, 10000ms, quiet);
+  auto metrics = std::make_shared<apex::observability::Metrics>();
+  LeaseManager dead_leases(dead_client, 10000ms, quiet, metrics);
 
   EXPECT_THROW(dead_client->ping(), RedisError);
 
@@ -143,6 +145,10 @@ TEST(RedisOutageTest, LeaseOperationsFailClosedWithoutInfrastructure) {
   EXPECT_EQ(attempt.result, LeaseAttempt::Result::RedisUnavailable);
   EXPECT_TRUE(attempt.token.empty()) << "fail-closed mints no token";
   EXPECT_FALSE(dead_leases.release("any-key", "whatever-token"));
+
+  const auto snapshot = metrics->snapshot();
+  EXPECT_EQ(snapshot.lease_unavailable, 0u) << "manager counts redis_failures, not lease_unavailable";
+  EXPECT_GE(snapshot.redis_failures, 1u);
 }
 
 }  // namespace

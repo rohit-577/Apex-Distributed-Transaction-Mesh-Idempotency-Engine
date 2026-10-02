@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace apex::persistence {
 
@@ -70,10 +71,12 @@ struct AcquireResult {
 class IdempotencyRepository {
  public:
   // Atomically establishes the PROCESSING row for (key, fingerprint), or
-  // returns the conflicting/committed row that won the race. Throws PgError
-  // on database failure (callers map to 503).
+  // returns the conflicting/committed row that won the race. The canonical
+  // body is stored for background re-execution (V003); it is never logged.
+  // Throws PgError on database failure (callers map to 503).
   [[nodiscard]] AcquireResult try_acquire(PgConnection& db, const std::string& key,
-                                          const std::string& fingerprint);
+                                          const std::string& fingerprint,
+                                          const std::string& canonical_body);
 
   [[nodiscard]] std::optional<IdempotencyRecord> find_by_key(PgConnection& db,
                                                              const std::string& key);
@@ -106,6 +109,20 @@ class IdempotencyRepository {
                                                         const std::string& key,
                                                         const std::string& fingerprint,
                                                         std::int64_t expected_epoch);
+
+  // Orphan candidates for background recovery: PROCESSING rows with a stored
+  // body idle longer than `idle_longer_than`, oldest first, at most `limit`.
+  // Served by the partial index (no full scan). Eligibility here is only a
+  // hint — the caller still acquires the lease and CASes the epoch per row,
+  // so concurrent traffic/reapers/instances resolve to exactly one owner.
+  struct OrphanCandidate {
+    std::string key;
+    std::string fingerprint;
+    std::string canonical_body;
+  };
+
+  [[nodiscard]] std::vector<OrphanCandidate> find_orphans(PgConnection& db, int limit,
+                                                          long long idle_longer_than_ms);
 };
 
 }  // namespace apex::persistence

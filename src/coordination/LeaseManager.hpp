@@ -31,7 +31,8 @@
 
 namespace apex::observability {
 class Logger;
-}
+class Metrics;
+}  // namespace apex::observability
 
 namespace apex::coordination {
 
@@ -51,8 +52,10 @@ struct LeaseAttempt {
 
 class LeaseManager {
  public:
+  // `metrics` is required: every acquisition/release verdict maps to exactly
+  // one counter (no silent coordination outcomes).
   LeaseManager(std::shared_ptr<RedisClient> redis, std::chrono::milliseconds ttl,
-               observability::Logger& logger);
+               observability::Logger& logger, std::shared_ptr<observability::Metrics> metrics);
 
   // Attempts one atomic acquisition with a FRESH owner token. Never throws:
   // Redis failures map to RedisUnavailable (fail-closed — the caller must
@@ -83,6 +86,7 @@ class LeaseManager {
   std::shared_ptr<RedisClient> redis_;
   std::chrono::milliseconds ttl_;
   observability::Logger& logger_;
+  std::shared_ptr<observability::Metrics> metrics_;
 };
 
 }  // namespace apex::coordination

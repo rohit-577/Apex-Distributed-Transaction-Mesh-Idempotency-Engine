@@ -6,6 +6,7 @@
 #include "coordination/RedisClient.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 
 namespace apex::coordination {
 
@@ -20,8 +21,9 @@ constexpr std::chrono::milliseconds kReconnectBackoff{500};
 
 CompletionSubscriber::CompletionSubscriber(std::shared_ptr<RedisClient> redis,
                                            idempotency::WaiterRegistry& registry,
-                                           observability::Logger& logger)
-    : redis_(std::move(redis)), registry_(registry), logger_(logger) {}
+                                           observability::Logger& logger,
+                                           std::shared_ptr<observability::Metrics> metrics)
+    : redis_(std::move(redis)), registry_(registry), logger_(logger), metrics_(std::move(metrics)) {}
 
 CompletionSubscriber::~CompletionSubscriber() { stop(); }
 
@@ -50,6 +52,8 @@ void CompletionSubscriber::run() {
   bool first = true;
   while (!stop_.load()) {
     if (!first) {
+      ++reconnects_;  // Only genuine re-subscriptions count, not the initial one.
+      metrics_->increment_subscriber_reconnects();
       const auto swept = registry_.prod_all();
       logger_.warning("subscriber reconnected; swept " + std::to_string(swept) +
                       " local waiters to re-check durable state");

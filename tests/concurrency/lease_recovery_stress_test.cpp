@@ -105,7 +105,7 @@ TEST_F(PgFixture, ConcurrentRecoveryElectsOneOwner) {
     const idempotency::Fingerprint fp =
         idempotency::fingerprint_for("POST", "/v1/operations", body);
     ASSERT_TRUE(fp.ok);
-    ASSERT_EQ(repo().try_acquire(*db, key, fp.hex).outcome,
+    ASSERT_EQ(repo().try_acquire(*db, key, fp.hex, fp.canonical_body).outcome,
               persistence::AcquireOutcome::Created);
   }
 
@@ -267,7 +267,7 @@ TEST_F(PgFixture, OwnerCompletionRacingRecoveryKeepsOneAuthoritativeResult) {
   ASSERT_TRUE(fp.ok);
   {
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, key, fp.hex).outcome,
+    ASSERT_EQ(repo().try_acquire(*db, key, fp.hex, fp.canonical_body).outcome,
               persistence::AcquireOutcome::Created);
   }
   // A holds the lease (active owner); B will race recovery anyway to prove

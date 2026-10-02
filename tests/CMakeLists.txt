@@ -23,6 +23,9 @@ add_executable(apex_tests
   integration/cross_system_test.cpp
   integration/waiter_lifecycle_test.cpp
   integration/subscriber_spike_test.cpp
+  integration/reaper_test.cpp
+  integration/resilience_docker_test.cpp
+  integration/metrics_test.cpp
   concurrency/parallel_health_test.cpp
   concurrency/idempotency_race_test.cpp
   concurrency/lease_recovery_stress_test.cpp
@@ -33,9 +36,11 @@ add_executable(apex_tests
 target_include_directories(apex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Absolute path to migrations/ so PostgreSQL-gated tests can apply V001
-# without depending on the process working directory.
+# without depending on the process working directory. APEX_COMPOSE_FILE
+# lets resilience tests control containers deterministically.
 target_compile_definitions(apex_tests PRIVATE
   "APEX_MIGRATIONS_DIR=\"${PROJECT_SOURCE_DIR}/migrations\""
+  "APEX_COMPOSE_FILE=\"${PROJECT_SOURCE_DIR}/docker-compose.yml\""
 )
 
 target_link_libraries(apex_tests PRIVATE

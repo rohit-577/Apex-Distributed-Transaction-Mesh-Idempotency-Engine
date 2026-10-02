@@ -41,6 +41,16 @@
 //                        works; this bounds missed-notification recovery.
 //   APEX_MAX_WAITERS_PER_KEY Per-operation waiter cap (DoS bound).    Default: 1024
 //                        (1..100000). Excess waiters answer 202 immediately.
+//   APEX_REAPER_INTERVAL_MS Background orphan-recovery pass interval. Default: 30000
+//                        (1000..600000). Scheduling only, never correctness.
+//   APEX_REAPER_BATCH_SIZE Max orphan candidates per pass.             Default: 10
+//                        (1..1000). Bounds one pass's DB/Redis/pool pressure.
+//   APEX_REAPER_ELIGIBLE_AFTER_MS Only rows idle longer than this   Default: 30000
+//                        are reaper-eligible (1000..3600000). Efficiency filter;
+//                        the lease + epoch CAS decide every adoption.
+//   APEX_NODE_ID         Stable node label for logs.                 Default: ""
+//                        (empty = auto "pid-<pid>"). Opaque, ≤64 chars; never
+//                        a secret, never used for decisions.
 //   APEX_LOG_LEVEL       debug|info|warning|error.          Default: info
 
 #include <cstdint>
@@ -69,6 +79,10 @@ struct Config {
   unsigned waiter_timeout_ms{30000};
   unsigned waiter_recheck_ms{1000};
   unsigned max_waiters_per_key{1024};
+  unsigned reaper_interval_ms{30000};
+  unsigned reaper_batch_size{10};
+  unsigned reaper_eligible_after_ms{30000};
+  std::string node_id;
   std::string log_level{"info"};
 
   // Baseline defaults (threads are fixed up to the hardware default).

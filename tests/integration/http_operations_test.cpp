@@ -153,7 +153,7 @@ TEST_F(PgFixture, DuplicateWhileProcessingGets202) {
   {
     auto db = raw_connect();
     const persistence::AcquireResult acquired =
-        repo().try_acquire(*db, key, fingerprint_of(R"({"p":1})"));
+        repo().try_acquire(*db, key, fingerprint_of(R"({"p":1})"), R"({"p":1})");
     ASSERT_EQ(acquired.outcome, persistence::AcquireOutcome::Created);
     ASSERT_EQ(acquired.record.fencing_epoch, 1);
   }
@@ -183,7 +183,7 @@ TEST_F(PgFixture, OrphanedProcessingRecoversToANewEpoch) {
   {
     auto db = raw_connect();
     const persistence::AcquireResult acquired =
-        repo().try_acquire(*db, key, fingerprint_of(R"({"o":1})"));
+        repo().try_acquire(*db, key, fingerprint_of(R"({"o":1})"), R"({"o":1})");
     ASSERT_EQ(acquired.outcome, persistence::AcquireOutcome::Created);
   }
   ASSERT_FALSE(leases().is_held(key)) << "no owner may hold this lease";

@@ -21,6 +21,7 @@
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/IdempotencyRepository.hpp"
 #include "persistence/PgConnection.hpp"
 
@@ -194,7 +195,7 @@ TEST_F(PgFixture, RedisDownProcessingFailsClosedTerminalReplays) {
   const std::string body = R"({"wl":9})";
   {
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, processing_key, fp_of(body)).outcome,
+    ASSERT_EQ(repo().try_acquire(*db, processing_key, fp_of(body), body).outcome,
               persistence::AcquireOutcome::Created);
   }
   // Seed COMPLETED through the live shared service (needs Redis).
@@ -212,8 +213,9 @@ TEST_F(PgFixture, RedisDownProcessingFailsClosedTerminalReplays) {
   dead_endpoint.pool_size = 1;
   auto dead_redis = std::make_shared<coordination::RedisClient>(std::move(dead_endpoint));
   apex::observability::Logger quiet(apex::observability::Level::Error);
+  auto metrics = std::make_shared<apex::observability::Metrics>();
   auto dead_leases = std::make_shared<coordination::LeaseManager>(
-      dead_redis, 10000ms, quiet);
+      dead_redis, 10000ms, quiet, metrics);
   auto dead_service = make_service(shared_pool(), quiet, dead_leases);
   test::TestServer server(waiter_config(), dead_service);
 
@@ -342,6 +344,8 @@ TEST_F(PgFixture, AbandonedOwnerIsRecoveredByWaiter) {
   // (Gate already opened above; both threads joined.)
   EXPECT_EQ(owner_status, 409);
   EXPECT_EQ(node.executor->executions(), 2u) << "owner + recoverer executed once each";
+  EXPECT_GE(shared_metrics()->snapshot().stale_rejections, 1u)
+      << "stale owner rejection must be counted";
 }
 
 TEST_F(PgFixture, ShutdownWithSuspendedWaitersExitsCleanly) {
@@ -361,7 +365,7 @@ TEST_F(PgFixture, ShutdownWithSuspendedWaitersExitsCleanly) {
   const std::string channel = idempotency::WaiterRegistry::channel_for(key, fp_of(body));
   {
     auto db = raw_connect();
-    ASSERT_EQ(repo().try_acquire(*db, key, fp_of(body)).outcome,
+    ASSERT_EQ(repo().try_acquire(*db, key, fp_of(body), body).outcome,
               persistence::AcquireOutcome::Created);
   }
   const coordination::LeaseAttempt held = leases().try_acquire(key);

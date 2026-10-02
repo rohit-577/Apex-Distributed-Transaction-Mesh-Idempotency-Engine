@@ -19,7 +19,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(Apex
-  VERSION 0.4.0
+  VERSION 0.5.0
   DESCRIPTION "Distributed Transaction Mesh & Idempotency Engine"
   LANGUAGES CXX
 )
@@ -71,8 +71,10 @@ add_library(apex_core STATIC
   src/idempotency/IdempotencyKey.cpp
   src/idempotency/Fingerprint.cpp
   src/idempotency/OperationExecutor.cpp
+  src/idempotency/CorrelationId.cpp
   src/idempotency/WaiterRegistry.cpp
   src/idempotency/IdempotencyService.cpp
+  src/observability/Metrics.cpp
   src/persistence/PgConnection.cpp
   src/persistence/ConnectionPool.cpp
   src/persistence/IdempotencyRepository.cpp
@@ -80,6 +82,7 @@ add_library(apex_core STATIC
   src/coordination/RedisClient.cpp
   src/coordination/LeaseManager.cpp
   src/coordination/CompletionSubscriber.cpp
+  src/recovery/OrphanReaper.cpp
 )
 
 target_include_directories(apex_core PUBLIC src)
@@ -129,7 +132,7 @@ if(APEX_WARNINGS_AS_ERRORS AND MSVC)
   target_compile_options(apex PRIVATE /WX)
 endif()
 
-target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase3" APEX_PHASE="phase-3")
+target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase4" APEX_PHASE="phase-4")
 
 # ---------------------------------------------------------------------------
 # Tests (separate target tree; see tests/CMakeLists.txt).

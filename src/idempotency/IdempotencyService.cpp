@@ -11,6 +11,7 @@
 #include "idempotency/OperationExecutor.hpp"
 #include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/IdempotencyRepository.hpp"
 #include "persistence/PgConnection.hpp"
@@ -143,13 +144,67 @@ IdempotencyService::IdempotencyService(ServiceDependencies deps, observability::
     : deps_(std::move(deps)), logger_(logger) {}
 
 OperationOutcome IdempotencyService::handle(const OperationRequest& request) {
+  // Single counting funnel: every outcome kind maps to exactly one process
+  // counter here, so no decision path can silently skip instrumentation.
+  // Wait is intentionally uncounted (Session counts waiter starts once per
+  // waiter lifetime; per-verdict counting would overcount recheck cycles).
+  OperationOutcome outcome;
+  try {
+    outcome = handle_inner(request);
+  } catch (const std::exception&) {
+    // Unreachable (handle_inner is no-throw); kept so worker threads can
+    // never die from an escaping exception.
+    outcome.kind = OperationOutcome::Kind::StorageUnavailable;
+    outcome.http_status = 503;
+    outcome.body = storage_unavailable_body();
+  }
+  auto& metrics = *deps_.metrics;
+  switch (outcome.kind) {
+    case OperationOutcome::Kind::Executed:
+    case OperationOutcome::Kind::Recovered:
+      metrics.increment_executions();
+      if (outcome.http_status >= 200 && outcome.http_status < 300) {
+        metrics.increment_executions_completed();
+      } else {
+        metrics.increment_executions_failed();
+      }
+      break;
+    case OperationOutcome::Kind::Replayed:
+      metrics.increment_completed_replays();
+      break;
+    case OperationOutcome::Kind::InProgress:
+      metrics.increment_deferred_processing_answers();
+      break;
+    case OperationOutcome::Kind::FingerprintConflict:
+      metrics.increment_fingerprint_conflicts();
+      break;
+    case OperationOutcome::Kind::FailedTerminal:
+      metrics.increment_failed_terminal_answers();
+      break;
+    case OperationOutcome::Kind::StaleEpoch:
+      metrics.increment_stale_rejections();
+      break;
+    case OperationOutcome::Kind::RedisUnavailable:
+      metrics.increment_lease_unavailable();
+      break;
+    case OperationOutcome::Kind::StorageUnavailable:
+      metrics.increment_pg_failures();
+      break;
+    case OperationOutcome::Kind::Wait:
+      break;  // Counted once per waiter lifetime in Session::enter_wait.
+  }
+  return outcome;
+}
+
+OperationOutcome IdempotencyService::handle_inner(const OperationRequest& request) {
   const auto started = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - started)
         .count();
   };
-  const std::string logged_key = observability::safe_key(request.key);
+  const std::string logged_key = observability::safe_key(request.key) + " cid=" +
+                                   (request.correlation_id.empty() ? "-" : request.correlation_id);
 
   OperationOutcome done;
   const auto storage_failure = [&](const std::string& what) {
@@ -212,8 +267,8 @@ OperationOutcome IdempotencyService::handle_first_request(
   }
   LeaseReleaser releaser(deps_.leases.get(), request.key, attempt.token);
 
-  const persistence::AcquireResult acquired = repo.try_acquire(db, request.key,
-                                                              request.fingerprint);
+  const persistence::AcquireResult acquired =
+      repo.try_acquire(db, request.key, request.fingerprint, request.canonical_body);
   if (acquired.outcome == persistence::AcquireOutcome::Created) {
     logger_.info("idempotency key=" + logged_key + " fp=" + request.fingerprint +
                  " transition=none->PROCESSING epoch=1");
@@ -283,9 +338,11 @@ OperationOutcome IdempotencyService::recover_with_lease(
   // concurrent recoverer presenting the same epoch loses deterministically;
   // a row that moved on (terminal, or newer epoch) yields nullopt and we
   // answer from the fresh durable state instead of assuming.
+  deps_.metrics->increment_recovery_attempts();
   const std::optional<std::int64_t> next =
       repo.try_recover(db, request.key, request.fingerprint, observed.fencing_epoch);
   if (!next.has_value()) {
+    deps_.metrics->increment_recovery_losses();
     const std::optional<IdempotencyRecord> fresh = repo.find_by_key(db, request.key);
     if (!fresh.has_value()) {
       // Rows are never deleted: reaching here means storage-level surprise.
@@ -303,6 +360,7 @@ OperationOutcome IdempotencyService::recover_with_lease(
   logger_.info("idempotency key=" + logged_key + " fp=" + request.fingerprint +
                " ownership-recovered epoch=" + std::to_string(observed.fencing_epoch) + "->" +
                std::to_string(*next));
+  deps_.metrics->increment_recovery_wins();
   return execute_owned(db, repo, request, *next, logged_key, elapsed_ms, done,
                        OperationOutcome::Kind::Recovered);
 }
