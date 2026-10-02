@@ -1,0 +1,49 @@
+#pragma once
+
+// Asynchronous HTTP accept loop. RAII over the acceptor socket:
+//
+// - start() binds, listens, and posts the first async_accept. Bind failures
+//   throw boost::system::system_error so main() can report them and exit.
+// - stop() cancels the acceptor; in-flight sessions drain on their own and
+//   destroy themselves. stop() is idempotent and safe to call from a signal
+//   handler dispatch (it only touches the acceptor and a flag).
+// - The io_context and its threads are owned by main(), not by this class,
+//   so shutdown sequencing (stop acceptor -> stop context -> join threads)
+//   is explicit and testable.
+
+#include <cstdint>
+#include <string>
+
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+
+#include "config/Config.hpp"
+
+namespace apex::execution {
+
+class HttpServer {
+ public:
+  HttpServer(boost::asio::io_context& ioc, const config::Config& config,
+             std::string version);
+
+  HttpServer(const HttpServer&) = delete;
+  HttpServer& operator=(const HttpServer&) = delete;
+
+  void start();
+  void stop();
+
+  // Bound port. Useful with port 0 (OS-assigned, used by tests).
+  // Only valid after start().
+  [[nodiscard]] std::uint16_t port() const;
+
+ private:
+  void do_accept();
+
+  boost::asio::io_context& ioc_;
+  config::Config config_;
+  std::string version_;
+  boost::asio::ip::tcp::acceptor acceptor_;
+  bool running_{false};
+};
+
+}  // namespace apex::execution

@@ -1,0 +1,44 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# vcpkg (lives outside the repo; only local artifacts are ignored here)
+vcpkg_installed/
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Local secrets / environment
+.env
+
+# Docker volumes persisted on the host
+docker-data/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+.DS_Store
+Thumbs.db
+
+# Test / coverage artifacts
+Testing/
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# Python virtualenv in the workspace root is unrelated to this C++ project.
+# It is intentionally left untouched and is NOT covered by this ignore file.

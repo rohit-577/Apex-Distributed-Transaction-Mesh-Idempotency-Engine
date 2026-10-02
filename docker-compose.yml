@@ -1,0 +1,57 @@
+# Apex Phase 0 development infrastructure.
+#
+# Provides PostgreSQL (durable system of record) and Redis (coordination /
+# cache / notification) for local development and for the infra smoke test.
+#
+# The compose project name is set explicitly because the workspace directory
+# name contains characters that are not safe for an implicit project name.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose ps
+#   powershell ./scripts/infra-smoke.ps1
+#   docker compose down
+#
+# Credentials come from `.env` (see `.env.example`). Defaults below are
+# development-only values and are safe to commit because they are only used
+# when `.env` does not override them.
+
+name: apex-phase0
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apex-dev-only}
+      POSTGRES_DB: ${POSTGRES_DB:-apex}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apex} -d ${POSTGRES_DB:-apex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  pgdata:
+  redisdata:

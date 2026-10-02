@@ -1,0 +1,11 @@
+{
+  "name": "apex",
+  "version": "0.1.0",
+  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 0 foundation)",
+  "dependencies": [
+    "boost-asio",
+    "boost-beast",
+    "gtest",
+    "nlohmann-json"
+  ]
+}
