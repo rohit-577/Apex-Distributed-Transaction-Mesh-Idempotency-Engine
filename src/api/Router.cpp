@@ -13,17 +13,6 @@ std::string_view path_only(std::string_view target) {
   return q == std::string_view::npos ? target : target.substr(0, q);
 }
 
-std::string not_implemented_body() {
-  const nlohmann::json body = {
-      {"error", "not_implemented"},
-      {"message",
-       "The idempotency engine is Phase 1 work. This Phase 0 baseline only proves the HTTP "
-       "gateway, configuration, and infrastructure wiring."},
-      {"contract", "POST /v1/operations with Idempotency-Key header (see docs/architecture.md)"},
-  };
-  return body.dump();
-}
-
 }  // namespace
 
 Router::Router(std::string version) : version_(std::move(version)) {}
@@ -34,19 +23,15 @@ RouteResult Router::route(http::verb method, std::string_view target) const {
   if (path == "/health") {
     if (method == http::verb::get) {
       const nlohmann::json body = {
-          {"status", "ok"}, {"service", "apex"}, {"version", version_}, {"phase", "phase-0"}};
+          {"status", "ok"}, {"service", "apex"}, {"version", version_}, {"phase", "phase-1"}};
       return {200, body.dump(), ""};
     }
     return {405, R"({"error":"method_not_allowed"})", "GET"};
   }
 
-  if (path == "/v1/operations") {
-    if (method == http::verb::post) {
-      return {501, not_implemented_body(), ""};
-    }
-    return {405, R"({"error":"method_not_allowed"})", "POST"};
-  }
-
+  // NOTE: POST /v1/operations is intentionally absent here. It needs the
+  // durable service (I/O + state), so Session dispatches it before the pure
+  // Router ever sees it — the same split as GET /ready.
   const nlohmann::json body = {{"error", "not_found"}, {"path", std::string(path)}};
   return {404, body.dump(), ""};
 }

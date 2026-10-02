@@ -1,5 +1,6 @@
 # Apex — Distributed Transaction Mesh & Idempotency Engine
-# Phase 0: engineering foundation (baseline HTTP gateway, no idempotency logic).
+# Phase 1: durable PostgreSQL-backed idempotency state (no Redis coordination,
+# no leases, no multiplexing — those are later phases).
 #
 # Configure (Visual Studio generator is the supported default on Windows):
 #   cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
@@ -18,7 +19,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(Apex
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "Distributed Transaction Mesh & Idempotency Engine"
   LANGUAGES CXX
 )
@@ -33,6 +34,11 @@ option(APEX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 find_package(boost_asio CONFIG REQUIRED)
 find_package(boost_beast CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+# libpq (durable state) + OpenSSL (SHA-256 for request fingerprints).
+# Provided by vcpkg: libpq via FindPostgreSQL wrapper, OpenSSL via its
+# official config. See scripts/configure.ps1 for the installed-tree path fix.
+find_package(PostgreSQL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Shared warning policy. MSVC /W4 is the baseline; warnings-as-errors is
@@ -57,6 +63,14 @@ add_library(apex_core STATIC
   src/execution/DependencyChecker.cpp
   src/execution/Session.cpp
   src/execution/HttpServer.cpp
+  src/idempotency/IdempotencyKey.cpp
+  src/idempotency/Fingerprint.cpp
+  src/idempotency/SimulatedOperation.cpp
+  src/idempotency/IdempotencyService.cpp
+  src/persistence/PgConnection.cpp
+  src/persistence/ConnectionPool.cpp
+  src/persistence/IdempotencyRepository.cpp
+  src/persistence/Schema.cpp
 )
 
 target_include_directories(apex_core PUBLIC src)
@@ -65,7 +79,13 @@ target_link_libraries(apex_core PUBLIC
   Boost::asio
   Boost::beast
   nlohmann_json::nlohmann_json
+  PostgreSQL::PostgreSQL
 )
+
+# OpenSSL::Crypto is implementation-only (Fingerprint.cpp); PRIVATE keeps it
+# out of consumers' link interfaces while still propagating to the final link
+# (required for static-library transitive linking).
+target_link_libraries(apex_core PRIVATE OpenSSL::Crypto)
 
 target_compile_options(apex_core PRIVATE ${APEX_WARNING_FLAGS})
 
@@ -99,7 +119,7 @@ if(APEX_WARNINGS_AS_ERRORS AND MSVC)
   target_compile_options(apex PRIVATE /WX)
 endif()
 
-target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase0")
+target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase1")
 
 # ---------------------------------------------------------------------------
 # Tests (separate target tree; see tests/CMakeLists.txt).

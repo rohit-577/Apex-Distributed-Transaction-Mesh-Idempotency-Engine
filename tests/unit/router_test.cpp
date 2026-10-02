@@ -36,18 +36,14 @@ TEST(RouterTest, WrongMethodOnHealthIs405WithAllowHeader) {
   EXPECT_EQ(result.allow, "GET");
 }
 
-TEST(RouterTest, OperationsStubIsExplicitlyNotImplemented) {
+TEST(RouterTest, OperationsPathIsDispatchedBeforeTheRouter) {
+  // POST /v1/operations needs durable state, so Session handles it before
+  // the pure Router runs (same split as GET /ready). The router must NOT
+  // claim the path: a 404 here proves the dispatch contract from the router
+  // side, and the Session side is covered by the HTTP operations tests.
   const Router router("test-version");
-  const RouteResult result = router.route(http::verb::post, "/v1/operations");
-  EXPECT_EQ(result.status, 501);
-  EXPECT_NE(result.body.find("not_implemented"), std::string::npos);
-}
-
-TEST(RouterTest, WrongMethodOnOperationsIs405) {
-  const Router router("test-version");
-  const RouteResult result = router.route(http::verb::get, "/v1/operations");
-  EXPECT_EQ(result.status, 405);
-  EXPECT_EQ(result.allow, "POST");
+  EXPECT_EQ(router.route(http::verb::post, "/v1/operations").status, 404);
+  EXPECT_EQ(router.route(http::verb::get, "/v1/operations").status, 404);
 }
 
 TEST(RouterTest, UnknownPathsAre404) {

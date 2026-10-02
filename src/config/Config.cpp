@@ -32,11 +32,17 @@ constexpr const char* kPortEnv = "APEX_PORT";
 constexpr const char* kThreadsEnv = "APEX_THREADS";
 constexpr const char* kPgHostEnv = "APEX_POSTGRES_HOST";
 constexpr const char* kPgPortEnv = "APEX_POSTGRES_PORT";
+constexpr const char* kPgUserEnv = "APEX_POSTGRES_USER";
+constexpr const char* kPgPasswordEnv = "APEX_POSTGRES_PASSWORD";
+constexpr const char* kPgDbEnv = "APEX_POSTGRES_DB";
+constexpr const char* kDbPoolEnv = "APEX_DB_POOL_SIZE";
+constexpr const char* kMigrationsEnv = "APEX_MIGRATIONS_DIR";
 constexpr const char* kRedisHostEnv = "APEX_REDIS_HOST";
 constexpr const char* kRedisPortEnv = "APEX_REDIS_PORT";
 constexpr const char* kLogLevelEnv = "APEX_LOG_LEVEL";
 
 constexpr unsigned kMaxThreads = 256;
+constexpr unsigned kMaxDbPool = 64;
 
 bool parse_port(const char* text, std::uint16_t& out) {
   if (text == nullptr || *text == '\0') {
@@ -51,17 +57,21 @@ bool parse_port(const char* text, std::uint16_t& out) {
   return true;
 }
 
-bool parse_threads(const char* text, unsigned& out) {
+bool parse_bounded_count(const char* text, unsigned& out, unsigned max) {
   if (text == nullptr || *text == '\0') {
     return false;
   }
   char* end = nullptr;
   const long value = std::strtol(text, &end, 10);
-  if (end == text || *end != '\0' || value < 1 || value > static_cast<long>(kMaxThreads)) {
+  if (end == text || *end != '\0' || value < 1 || value > static_cast<long>(max)) {
     return false;
   }
   out = static_cast<unsigned>(value);
   return true;
+}
+
+bool parse_threads(const char* text, unsigned& out) {
+  return parse_bounded_count(text, out, kMaxThreads);
 }
 
 unsigned default_threads() {
@@ -108,6 +118,28 @@ std::pair<Config, std::vector<std::string>> Config::load_from_environment() {
       cfg.postgres_port = 5432;
     }
   }
+  if (const auto v = get_env(kPgUserEnv); v && !v->empty()) {
+    cfg.postgres_user = *v;
+  }
+  // The password intentionally has no warning text: values must never appear
+  // in logs, even as "invalid '***'". An absent variable simply means "send
+  // no password" (trust/peer auth).
+  if (const auto v = get_env(kPgPasswordEnv); v) {
+    cfg.postgres_password = *v;
+  }
+  if (const auto v = get_env(kPgDbEnv); v && !v->empty()) {
+    cfg.postgres_db = *v;
+  }
+  if (const auto v = get_env(kDbPoolEnv); v && !v->empty()) {
+    if (!parse_bounded_count(v->c_str(), cfg.db_pool_size, kMaxDbPool)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kDbPoolEnv +
+                            "; using default 8.");
+      cfg.db_pool_size = 8;
+    }
+  }
+  if (const auto v = get_env(kMigrationsEnv); v && !v->empty()) {
+    cfg.migrations_dir = *v;
+  }
   if (const auto v = get_env(kRedisHostEnv); v && !v->empty()) {
     cfg.redis_host = *v;
   }
@@ -135,6 +167,18 @@ std::string Config::validate() const {
   if (postgres_host.empty()) {
     return "postgres_host must not be empty";
   }
+  if (postgres_user.empty()) {
+    return "postgres_user must not be empty";
+  }
+  if (postgres_db.empty()) {
+    return "postgres_db must not be empty";
+  }
+  if (db_pool_size < 1 || db_pool_size > kMaxDbPool) {
+    return "db_pool_size must be in [1, 64]";
+  }
+  if (migrations_dir.empty()) {
+    return "migrations_dir must not be empty";
+  }
   if (redis_host.empty()) {
     return "redis_host must not be empty";
   }
@@ -143,6 +187,34 @@ std::string Config::validate() const {
     return "log_level must be one of debug|info|warning|error";
   }
   return "";
+}
+
+std::string Config::postgres_conninfo() const {
+  // libpq keyword/value format. connect_timeout bounds every new connection
+  // (including startup schema checks) so a dead database delays but never
+  // hangs the gateway. application_name identifies us in pg_stat_activity.
+  // NOTE: the result contains the password when one is configured — secret.
+  const auto quote = [](const std::string& value) {
+    if (value.find_first_of(" \t'\\") == std::string::npos) {
+      return value;
+    }
+    std::string out = "'";
+    for (char c : value) {
+      if (c == '\'' || c == '\\') {
+        out += '\\';
+      }
+      out += c;
+    }
+    out += "'";
+    return out;
+  };
+  std::string info = "host=" + quote(postgres_host) + " port=" + std::to_string(postgres_port) +
+                     " dbname=" + quote(postgres_db) + " user=" + quote(postgres_user) +
+                     " connect_timeout=5 application_name=apex";
+  if (!postgres_password.empty()) {
+    info += " password=" + quote(postgres_password);
+  }
+  return info;
 }
 
 }  // namespace apex::config

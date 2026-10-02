@@ -65,8 +65,9 @@ and measured performance outrank features.
 
 ## 7. Scope discipline
 
-- Stay in the current phase. Phase 0 = foundation only; do not implement
-  the idempotency engine until the user opens Phase 1.
+- Stay in the current phase. Phase 1 = durable idempotency state only; do
+  not implement Redis coordination, leases, waiter multiplexing, fencing
+  epochs, or distributed recovery until the user opens the next phase.
 - Keep changes scoped; do not reformat unrelated files; do not touch the
   workspace `.venv/` (unrelated to this C++ project).
 - No TODO placeholders pretending to be implementations. Unfinished work is

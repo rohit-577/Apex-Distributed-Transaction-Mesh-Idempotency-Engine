@@ -26,6 +26,14 @@
 #include "api/Router.hpp"
 #include "config/Config.hpp"
 
+namespace apex::idempotency {
+class IdempotencyService;
+}  // namespace apex::idempotency
+
+namespace boost::asio {
+class thread_pool;
+}  // namespace boost::asio
+
 namespace apex::execution {
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -34,17 +42,25 @@ class Session : public std::enable_shared_from_this<Session> {
 
   // Takes ownership of a connected socket. `version` is reported in JSON
   // bodies; it comes from the APEX_VERSION compile definition.
+  // `service`/`db_pool` wire the durable idempotency layer: both null means
+  // storage is not configured and POST /v1/operations answers 503. When a
+  // service is present, db_pool must outlive every session (owned by main()
+  // or the test fixture, joined before destruction).
   static void launch(boost::asio::ip::tcp::socket socket, const config::Config& config,
-                     std::string version);
+                     std::string version,
+                     std::shared_ptr<idempotency::IdempotencyService> service,
+                     boost::asio::thread_pool* db_pool);
 
  private:
   Session(boost::asio::ip::tcp::socket socket, const config::Config& config,
-          std::string version);
+          std::string version, std::shared_ptr<idempotency::IdempotencyService> service,
+          boost::asio::thread_pool* db_pool);
 
   void do_read();
   void on_read(boost::beast::error_code ec);
   void handle_request();
   void handle_ready(boost::beast::http::verb method, unsigned version, bool keep_alive);
+  void handle_operations(unsigned version, bool keep_alive);
   void send_json(int status, const std::string& body, unsigned version, bool keep_alive,
                  const std::string& allow = "");
   void do_write();
@@ -57,6 +73,8 @@ class Session : public std::enable_shared_from_this<Session> {
   boost::beast::http::response<boost::beast::http::string_body> response_;
   config::Config config_;
   api::Router router_;
+  std::shared_ptr<idempotency::IdempotencyService> service_;
+  boost::asio::thread_pool* db_pool_;
 };
 
 }  // namespace apex::execution

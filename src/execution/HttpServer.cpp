@@ -9,8 +9,15 @@ namespace apex::execution {
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
-HttpServer::HttpServer(asio::io_context& ioc, const config::Config& config, std::string version)
-    : ioc_(ioc), config_(config), version_(std::move(version)), acceptor_(ioc) {}
+HttpServer::HttpServer(asio::io_context& ioc, const config::Config& config, std::string version,
+                       std::shared_ptr<idempotency::IdempotencyService> service,
+                       asio::thread_pool* db_pool)
+    : ioc_(ioc),
+      config_(config),
+      version_(std::move(version)),
+      service_(std::move(service)),
+      db_pool_(db_pool),
+      acceptor_(ioc) {}
 
 void HttpServer::start() {
   const tcp::endpoint endpoint{tcp::v4(), config_.port};
@@ -44,7 +51,7 @@ void HttpServer::do_accept() {
       return;
     }
     if (!ec) {
-      Session::launch(std::move(socket), config_, version_);
+      Session::launch(std::move(socket), config_, version_, service_, db_pool_);
     }
     // On transient accept errors the loop continues; on stop() running_ is
     // false and the chain ends here. The server object must outlive pending

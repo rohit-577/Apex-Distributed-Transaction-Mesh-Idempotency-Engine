@@ -68,6 +68,18 @@ Write-Host "Generator: $Generator"
 $BuildType = @()
 if ($NoTests) { $BuildType += "-DAPEX_BUILD_TESTS=OFF" }
 
+# vcpkg's installed tree must live in a path WITHOUT spaces or shell-special
+# characters (notably this repo's own directory name). Meson/pkg-config based
+# ports (e.g. libpq) emit backslash-escaped include paths that MSVC's cl.exe
+# cannot parse, so building them with an installed tree under this repo fails.
+# Redirecting VCPKG_INSTALLED_DIR keeps the manifest as the single source of
+# truth while giving those build systems clean paths. The directory is a pure
+# local build artifact (outside the repo, git-irrelevant).
+$InstalledDir = Join-Path ([System.Environment]::GetFolderPath("LocalApplicationData")) `
+  "apex\vcpkg-installed"
+$BuildType += "-DVCPKG_INSTALLED_DIR=$InstalledDir"
+Write-Host "vcpkg installed dir: $InstalledDir"
+
 & cmake -S $Root -B (Join-Path $Root "build") -G $Generator -A x64 `
   "-DCMAKE_TOOLCHAIN_FILE=$Toolchain" @BuildType
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

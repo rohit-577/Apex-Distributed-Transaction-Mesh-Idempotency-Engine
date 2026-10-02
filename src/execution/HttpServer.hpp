@@ -19,12 +19,25 @@
 
 #include "config/Config.hpp"
 
+namespace apex::idempotency {
+class IdempotencyService;
+}  // namespace apex::idempotency
+
+namespace boost::asio {
+class thread_pool;
+}  // namespace boost::asio
+
 namespace apex::execution {
 
 class HttpServer {
  public:
+  // `service`/`db_pool` wire POST /v1/operations to durable storage (both
+  // null = storage unwired, operations answer 503). Lifetimes: the pool and
+  // its threads must outlive the server (see main() shutdown sequence).
   HttpServer(boost::asio::io_context& ioc, const config::Config& config,
-             std::string version);
+             std::string version,
+             std::shared_ptr<idempotency::IdempotencyService> service = nullptr,
+             boost::asio::thread_pool* db_pool = nullptr);
 
   HttpServer(const HttpServer&) = delete;
   HttpServer& operator=(const HttpServer&) = delete;
@@ -42,6 +55,8 @@ class HttpServer {
   boost::asio::io_context& ioc_;
   config::Config config_;
   std::string version_;
+  std::shared_ptr<idempotency::IdempotencyService> service_;
+  boost::asio::thread_pool* db_pool_;
   boost::asio::ip::tcp::acceptor acceptor_;
   bool running_{false};
 };

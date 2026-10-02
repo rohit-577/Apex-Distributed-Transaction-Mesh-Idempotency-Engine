@@ -1,64 +1,66 @@
 # Apex Idempotency Record State Machine
 
-Status: **Declared (design intent for Phase 1). Nothing here is implemented —
-`POST /v1/operations` returns `501` and there is no database table yet.**
-This document exists so Phase 1 implements against a reviewed contract
-instead of inventing transitions under pressure.
+Status: **Implemented (Phase 1) for the durable core. Fencing epochs,
+waiters, and lease recovery are later-phase work and are marked as such.**
 
 ## Record lifecycle (one row per idempotency key, durable in PostgreSQL)
 
 ```text
-              create (INSERT … ON CONFLICT DO NOTHING + fencing epoch)
-                |
-                v
-            +---------+
-            | PENDING | ---(owner executes business op)---+
-            +---------+                                   |
-                |                                         |
-   terminal write with fencing check                      |
-    (UPDATE … WHERE epoch = :mine)                        |
-        |                          |                      |
-        v                          v                      |
-   +-----------+             +-----------+                |
-   | COMPLETED |             |  FAILED   |<---------------+
-   +-----------+             +-----------+
-        |                          |
-        v                          v
-   return stored              return stored
-   response to                error to owner
-   owner + waiters            + waiters
+atomic acquire (INSERT … ON CONFLICT DO NOTHING, one transaction)
+    |
+    +-- inserted -----> +------------+
+    |                   | PROCESSING | ---(owner executes operation)---+
+    |                   +------------+                                |
+    |                       |                                       |
+    |          terminal write, guarded:                             |
+    |          UPDATE … WHERE status='PROCESSING' AND fp=:fp        |
+    |              |                          |                      |
+    |              v                          v                      |
+    |        +-----------+              +-----------+                |
+    |        | COMPLETED |              |  FAILED   |<---------------+
+    |        +-----------+              +-----------+
+    |              |                           |
+    |              v                           v
+    |        replay stored                409 with original
+    |        response                     failure attached
+    |
+    +-- conflicted ---> read winner's committed row, then:
+                           same fingerprint + PROCESSING -> 202
+                           same fingerprint + COMPLETED  -> replay
+                           same fingerprint + FAILED     -> 409
+                           different fingerprint       -> 409 conflict
 ```
 
-- Only `PENDING → COMPLETED` and `PENDING → FAILED` transitions exist.
-  Terminal states are final: no transition out of `COMPLETED`/`FAILED`.
-- A duplicate arriving while `PENDING` attaches as a **waiter** (no new
-  execution, no new row).
-- A duplicate arriving at a terminal state receives the **stored response
-  byte-for-byte** without re-executing anything.
-- Every write carries the owner's **fencing epoch**; the `UPDATE` predicate
-  includes `epoch = :mine`, so a stale owner whose lease expired mid-flight
-  (see `docs/failure-model.md`) updates zero rows and must re-read instead
-  of overwriting the successor's state.
+- Only `PROCESSING → COMPLETED` and `PROCESSING → FAILED` exist. Terminal
+  states are final: the guarded UPDATE affects 0 rows on a terminal record,
+  so replays, retries, and late writes cannot move it (tested: TEST F).
+- There is no `PENDING` state and no epoch column in Phase 1. The Phase 0
+  draft named them against a Redis-lease design that is explicitly deferred;
+  V002 will add ownership columns when the coordination phase lands.
 
-## Ownership / fencing epoch (declared)
+## Transaction boundaries (each is one libpq transaction unless noted)
 
-- The lease grant (Redis, Phase 1) mints a monotonically increasing epoch
-  per key and the owner stores it in the `PENDING` row it created or adopted.
-- Epoch comparison is the *only* authority for "who may write"; wall-clock
-  TTL expiry is a hint that an epoch *may* be superseded, never proof of
-  ownership.
+| Transition | Transaction | On rollback / crash |
+|---|---|---|
+| none → `PROCESSING` | `BEGIN` → `INSERT … ON CONFLICT DO NOTHING RETURNING` → `COMMIT` (or `ROLLBACK` when conflicted, then autocommit `SELECT`) | No row exists. A crash before `COMMIT` is indistinguishable from "never arrived": the client retries with the same key. |
+| `PROCESSING → COMPLETED` | Single-statement autocommit `UPDATE … WHERE status='PROCESSING' AND fingerprint=…` | Atomic by construction: either the full result payload lands or nothing does. |
+| `PROCESSING → FAILED` | Same shape as COMPLETED, storing `error_code`/`error_message`. | Same atomicity. |
+| Concurrent losers | Block inside their `INSERT` on the winner's uncommitted key, then read the settled row. Observable states are only ever committed ones. | — |
 
-## Waiter behavior (declared)
+## Crash windows (honest, not solved)
 
-1. Attach to the in-flight execution (in-process map; cross-process via
-   Redis hint + durable poll — notification is best-effort).
-2. On hint or poll tick, re-read the durable row.
-3. Return only when the row is `COMPLETED`/`FAILED`; otherwise keep waiting
-   up to the request deadline, then return `503`/`504` (still safe: the
-   client retries with the same key and gets the terminal response later).
+- **Crash between acquire-commit and terminal write:** a `PROCESSING` row is
+  orphaned. It answers `202` to duplicates until the later lease-recovery
+  phase reaps or adopts it. Operators can spot these rows (`completed_at IS
+  NULL`, old `created_at`). Distributed lease recovery is explicitly out of
+  scope for Phase 1.
+- **Crash mid-`UPDATE`:** impossible to observe half-written — single
+  statement, single row.
+- **Process death with in-flight HTTP sessions:** in-memory waiters die;
+  committed rows survive; clients retry with the same key and converge on
+  the terminal response.
 
-## Out of scope for the state machine
+## Out of scope
 
-Key expiration/GC policy, request schema details, and response-storage size
-limits are Phase 1 design tasks and will extend this document — not
-contradict it.
+Key expiration/GC policy and response-size caps beyond the 1 MiB request
+limit are later-phase work and will extend this document — not contradict it.

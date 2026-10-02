@@ -3,13 +3,13 @@
 // Synchronous request router. Pure function of (method, target) -> result,
 // which is what makes it unit-testable without sockets.
 //
-// Phase 0 contract:
+// Contract:
 //   GET  /health           -> 200 {"status":"ok", ...}
-//   POST /v1/operations    -> 501 (idempotency engine is Phase 1 work; the
-//                              stub says so explicitly in the response body)
 //   GET  /ready            -> handled asynchronously by Session because it
 //                              performs non-blocking dependency checks. The
 //                              router never sees it.
+//   POST /v1/operations    -> likewise handled by Session: it needs the
+//                              durable idempotency service (state + I/O).
 //   anything else          -> 404, wrong method on a known path -> 405.
 //
 // Routing is strict: trailing slashes do not match. Query strings are

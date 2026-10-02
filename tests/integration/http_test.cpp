@@ -48,12 +48,16 @@ TEST(HttpIntegrationTest, UnknownPathReturns404Json) {
   EXPECT_NE(result.body.find("not_found"), std::string::npos);
 }
 
-TEST(HttpIntegrationTest, OperationsEndpointIsExplicitlyUnimplemented) {
+TEST(HttpIntegrationTest, OperationsWithoutStorageAnswers503) {
+  // This fixture wires no durable service, so the operations route must fail
+  // honestly (503) rather than pretend to work. The full contract against a
+  // real database lives in http_operations_test.cpp.
   test::TestServer server(test_config());
-  const test::HttpResult result = test::http_send("127.0.0.1", server.port(), http::verb::post,
-                                                  "/v1/operations", R"({"op":"write"})");
-  EXPECT_EQ(result.status, 501);
-  EXPECT_NE(result.body.find("not_implemented"), std::string::npos);
+  const test::HttpResult result = test::http_send_with_headers(
+      "127.0.0.1", server.port(), http::verb::post, "/v1/operations", R"({"op":"write"})",
+      {{"Idempotency-Key", "phase0-key"}});
+  EXPECT_EQ(result.status, 503);
+  EXPECT_NE(result.body.find("storage_unavailable"), std::string::npos);
 }
 
 TEST(HttpIntegrationTest, ReadyReports503WhenDependenciesAreDown) {

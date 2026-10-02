@@ -1,10 +1,13 @@
 #include "common/test_helpers.hpp"
 
 #include <cstdlib>
+#include <optional>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+
+#include "idempotency/IdempotencyService.hpp"
 
 #if defined(_WIN32)
 #include <Windows.h>
@@ -64,17 +67,53 @@ TestServer::TestServer(config::Config config) : server_(ioc_, config, "test-vers
   thread_ = std::thread([this] { ioc_.run(); });
 }
 
+TestServer::TestServer(config::Config config,
+                       std::shared_ptr<idempotency::IdempotencyService> service)
+    : db_pool_(std::make_unique<boost::asio::thread_pool>(
+          config.db_pool_size < 1 ? 1 : config.db_pool_size)),
+      server_(ioc_, config, "test-version", std::move(service), db_pool_.get()) {
+  server_.start();
+  thread_ = std::thread([this] { ioc_.run(); });
+}
+
 TestServer::~TestServer() {
   server_.stop();
   ioc_.stop();
   if (thread_.joinable()) {
     thread_.join();
   }
+  // Drain database work posted by in-flight sessions before the pool that
+  // owns their connections can be destroyed by the caller. Completions post
+  // back to the stopped ioc_ and are dropped safely.
+  if (db_pool_) {
+    db_pool_->join();
+  }
 }
 
-HttpResult http_send(const std::string& host, std::uint16_t port,
-                     boost::beast::http::verb method, const std::string& target,
-                     const std::string& body) {
+std::optional<std::string> pg_test_conninfo() {
+#if defined(_WIN32)
+  char* buffer = nullptr;
+  std::size_t length = 0;
+  if (_dupenv_s(&buffer, &length, "APEX_TEST_POSTGRES_CONN") == 0 && buffer != nullptr) {
+    std::string value(buffer);
+    std::free(buffer);
+    if (!value.empty()) {
+      return value;
+    }
+  }
+  return std::nullopt;
+#else
+  if (const char* value = std::getenv("APEX_TEST_POSTGRES_CONN"); value != nullptr &&
+                                                                  *value != '\0') {
+    return std::string(value);
+  }
+  return std::nullopt;
+#endif
+}
+
+HttpResult http_send_with_headers(const std::string& host, std::uint16_t port,
+                                  boost::beast::http::verb method, const std::string& target,
+                                  const std::string& body, const HttpHeaders& headers) {
   namespace asio = boost::asio;
   namespace beast = boost::beast;
   namespace http = beast::http;
@@ -87,7 +126,10 @@ HttpResult http_send(const std::string& host, std::uint16_t port,
 
   http::request<http::string_body> req{method, target, 11};
   req.set(http::field::host, host);
-  req.set(http::field::user_agent, "apex-tests/phase0");
+  req.set(http::field::user_agent, "apex-tests/phase1");
+  for (const auto& [name, value] : headers) {
+    req.set(name, value);
+  }
   req.body() = body;
   req.prepare_payload();
   http::write(stream, req);
