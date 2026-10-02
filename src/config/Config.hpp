@@ -33,6 +33,14 @@
 //   APEX_REDIS_OP_TIMEOUT_MS Per-command Redis deadline.   Default: 2000
 //                        (100..60000). Bounds every lease operation so a dead
 //                        Redis delays but never hangs a worker.
+//   APEX_WAITER_TIMEOUT_MS Max time one request waits for another      Default: 30000
+//                        generation's completion (1000..300000). Expiry answers
+//                        202 WITHOUT touching durable state (INV-MUX-06).
+//   APEX_WAITER_RECHECK_MS Fallback durable re-check interval.        Default: 1000
+//                        (100..30000). Pub/sub wakes arrive sooner when delivery
+//                        works; this bounds missed-notification recovery.
+//   APEX_MAX_WAITERS_PER_KEY Per-operation waiter cap (DoS bound).    Default: 1024
+//                        (1..100000). Excess waiters answer 202 immediately.
 //   APEX_LOG_LEVEL       debug|info|warning|error.          Default: info
 
 #include <cstdint>
@@ -58,6 +66,9 @@ struct Config {
   unsigned redis_pool_size{8};
   unsigned lease_ttl_ms{10000};
   unsigned redis_op_timeout_ms{2000};
+  unsigned waiter_timeout_ms{30000};
+  unsigned waiter_recheck_ms{1000};
+  unsigned max_waiters_per_key{1024};
   std::string log_level{"info"};
 
   // Baseline defaults (threads are fixed up to the hardware default).

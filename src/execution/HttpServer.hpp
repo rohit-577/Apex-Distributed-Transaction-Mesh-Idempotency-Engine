@@ -18,6 +18,7 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include "config/Config.hpp"
+#include "observability/Logger.hpp"
 
 namespace apex::idempotency {
 class IdempotencyService;
@@ -32,13 +33,13 @@ namespace apex::execution {
 class HttpServer {
  public:
   // `service`/`db_pool` wire POST /v1/operations to durable storage (both
-  // null = storage unwired, operations answer 503). Lifetimes: the pool and
-  // its threads must outlive the server (see main() shutdown sequence).
+  // null = storage unwired, operations answer 503). `logger` emits waiter
+  // lifecycle events from sessions. Lifetimes: pool, threads, service, and
+  // logger must outlive the server (see main() shutdown sequence).
   HttpServer(boost::asio::io_context& ioc, const config::Config& config,
-             std::string version,
-             std::shared_ptr<idempotency::IdempotencyService> service = nullptr,
-             boost::asio::thread_pool* db_pool = nullptr);
-
+             std::string version, std::string phase,
+             std::shared_ptr<idempotency::IdempotencyService> service,
+             boost::asio::thread_pool* db_pool, observability::Logger& logger);
   HttpServer(const HttpServer&) = delete;
   HttpServer& operator=(const HttpServer&) = delete;
 
@@ -55,8 +56,10 @@ class HttpServer {
   boost::asio::io_context& ioc_;
   config::Config config_;
   std::string version_;
+  std::string phase_;
   std::shared_ptr<idempotency::IdempotencyService> service_;
   boost::asio::thread_pool* db_pool_;
+  observability::Logger& logger_;
   boost::asio::ip::tcp::acceptor acceptor_;
   bool running_{false};
 };

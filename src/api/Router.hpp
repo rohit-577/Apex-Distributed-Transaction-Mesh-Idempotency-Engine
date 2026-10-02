@@ -30,13 +30,16 @@ struct RouteResult {
 
 class Router {
  public:
-  explicit Router(std::string version);
+  // Both strings come from compile definitions (APEX_VERSION / APEX_PHASE)
+  // so /health can never report a phase the binary was not built for.
+  Router(std::string version, std::string phase);
 
   [[nodiscard]] RouteResult route(boost::beast::http::verb method,
                                   std::string_view target) const;
 
  private:
   std::string version_;
+  std::string phase_;
 };
 
 }  // namespace apex::api

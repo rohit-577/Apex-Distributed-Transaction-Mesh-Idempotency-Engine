@@ -34,6 +34,7 @@ class PgConnection;
 namespace apex::coordination {
 class LeaseManager;
 class RedisClient;
+class CompletionSubscriber;
 }  // namespace apex::coordination
 
 namespace apex::observability {
@@ -42,9 +43,14 @@ class Logger;
 
 namespace apex::idempotency {
 class IdempotencyService;
-}
+class OperationExecutor;
+class WaiterRegistry;
+struct WaiterOptions;
+}  // namespace apex::idempotency
 
 namespace apex::test {
+
+class GatedExecutor;
 
 class PgFixture : public ::testing::Test {
  protected:
@@ -69,6 +75,41 @@ class PgFixture : public ::testing::Test {
   coordination::LeaseManager& leases();
   coordination::RedisClient& redis();
 
+  // Isolated node bundle for cross-node / subscriber-control tests: a fresh
+  // service with its own registry (own waiter slots) sharing the process
+  // pool/Redis/leases. The bundled subscriber starts STOPPED; start it
+  // explicitly when the test needs cross-node wake-up, leave it stopped to
+  // exercise the fallback path. Destruction stops the subscriber first.
+  struct NodeBundle {
+    std::shared_ptr<idempotency::WaiterRegistry> registry;
+    std::shared_ptr<GatedExecutor> executor;
+    std::shared_ptr<idempotency::IdempotencyService> service;
+    std::shared_ptr<coordination::CompletionSubscriber> subscriber;
+    ~NodeBundle();
+  };
+
+  [[nodiscard]] static NodeBundle make_node(bool gate_open = true);
+  [[nodiscard]] static NodeBundle make_node_with_options(
+      const idempotency::WaiterOptions& options, bool gate_open = true);
+  // Node sharing an externally owned executor (cross-node execution
+  // counting: one counter across both nodes proves single execution).
+  [[nodiscard]] static NodeBundle make_node_with_executor(
+      std::shared_ptr<GatedExecutor> executor, const idempotency::WaiterOptions& options);
+
+  // Default waiter options for tests (short fallback, generous timeout).
+  // Production defaults live in Config and are far more conservative.
+  [[nodiscard]] static idempotency::WaiterOptions test_waiter_options();
+
+  // Ad-hoc service builder for fail-closed tests (dead pool / dead Redis /
+  // null leases). Null executor/registry/redis fall back to a simulated
+  // executor, a fresh registry, and the shared Redis client.
+  [[nodiscard]] static std::shared_ptr<idempotency::IdempotencyService> make_service(
+      std::shared_ptr<persistence::ConnectionPool> pool, observability::Logger& logger,
+      std::shared_ptr<coordination::LeaseManager> leases,
+      std::shared_ptr<idempotency::OperationExecutor> executor = nullptr,
+      std::shared_ptr<idempotency::WaiterRegistry> registry = nullptr,
+      std::shared_ptr<coordination::RedisClient> redis = nullptr);
+
  private:
   static std::optional<std::string> s_conninfo;
   static std::shared_ptr<persistence::ConnectionPool> s_pool;
@@ -81,12 +122,23 @@ class PgFixture : public ::testing::Test {
   static std::uint16_t s_redis_port;
   static std::shared_ptr<coordination::RedisClient> s_redis;
   static std::shared_ptr<coordination::LeaseManager> s_leases;
+  static std::shared_ptr<idempotency::WaiterRegistry> s_registry;
+  static std::shared_ptr<idempotency::OperationExecutor> s_executor;
+  static std::shared_ptr<coordination::CompletionSubscriber> s_subscriber;
 
  protected:
   // Shared service for HTTP-level tests (wired into TestServer).
   static std::shared_ptr<idempotency::IdempotencyService> service() { return s_service; }
   static std::shared_ptr<persistence::ConnectionPool> shared_pool() { return s_pool; }
   static std::shared_ptr<coordination::LeaseManager> shared_leases() { return s_leases; }
+  static std::shared_ptr<coordination::RedisClient> shared_redis_client() { return s_redis; }
+  static std::shared_ptr<idempotency::WaiterRegistry> shared_registry() { return s_registry; }
+  // Shared (stopped) subscriber for tests that need cross-node wake-up on
+  // the shared registry. Start explicitly; most tests leave it stopped
+  // (local notify + fallback cover same-process waiting).
+  static std::shared_ptr<coordination::CompletionSubscriber> shared_subscriber() {
+    return s_subscriber;
+  }
 
   std::vector<std::string> owned_keys_;
 };

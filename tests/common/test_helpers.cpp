@@ -11,6 +11,8 @@
 
 #if defined(_WIN32)
 #include <Windows.h>
+#else
+#include <unistd.h>
 #endif
 
 namespace apex::test {
@@ -62,7 +64,16 @@ std::uint16_t acquire_closed_port() {
   return port;
 }
 
-TestServer::TestServer(config::Config config) : server_(ioc_, config, "test-version") {
+unsigned long test_process_id() {
+#if defined(_WIN32)
+  return static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+  return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+TestServer::TestServer(config::Config config)
+    : server_(ioc_, config, "test-version", "test-phase", nullptr, nullptr, logger_) {
   server_.start();
   thread_ = std::thread([this] { ioc_.run(); });
 }
@@ -71,7 +82,8 @@ TestServer::TestServer(config::Config config,
                        std::shared_ptr<idempotency::IdempotencyService> service)
     : db_pool_(std::make_unique<boost::asio::thread_pool>(
           config.db_pool_size < 1 ? 1 : config.db_pool_size)),
-      server_(ioc_, config, "test-version", std::move(service), db_pool_.get()) {
+      server_(ioc_, config, "test-version", "test-phase", std::move(service), db_pool_.get(),
+              logger_) {
   server_.start();
   thread_ = std::thread([this] { ioc_.run(); });
 }

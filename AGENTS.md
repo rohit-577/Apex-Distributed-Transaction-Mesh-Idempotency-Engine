@@ -65,10 +65,10 @@ and measured performance outrank features.
 
 ## 7. Scope discipline
 
-- Stay in the current phase. Phase 2 = Redis lease ownership + durable
-  fencing epochs only; do not implement pub/sub, waiter multiplexing,
-  Redlock, or distributed recovery beyond orphan-epoch advancement until
-  the user opens the next phase.
+- Stay in the current phase. Phase 3 = in-flight request multiplexing
+  (waiter registry, pub/sub wake-up, timeouts) on top of the Phase 2
+  ownership/fencing protocol, which must not be weakened. Do not implement
+  Redlock, Streams, renewal, or any Phase 4 work until the user opens it.
 - Keep changes scoped; do not reformat unrelated files; do not touch the
   workspace `.venv/` (unrelated to this C++ project).
 - No TODO placeholders pretending to be implementations. Unfinished work is

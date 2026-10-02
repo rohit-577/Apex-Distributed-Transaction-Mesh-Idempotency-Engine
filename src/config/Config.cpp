@@ -43,6 +43,9 @@ constexpr const char* kRedisPasswordEnv = "APEX_REDIS_PASSWORD";
 constexpr const char* kRedisPoolEnv = "APEX_REDIS_POOL_SIZE";
 constexpr const char* kLeaseTtlEnv = "APEX_LEASE_TTL_MS";
 constexpr const char* kRedisTimeoutEnv = "APEX_REDIS_OP_TIMEOUT_MS";
+constexpr const char* kWaiterTimeoutEnv = "APEX_WAITER_TIMEOUT_MS";
+constexpr const char* kWaiterRecheckEnv = "APEX_WAITER_RECHECK_MS";
+constexpr const char* kMaxWaitersEnv = "APEX_MAX_WAITERS_PER_KEY";
 constexpr const char* kLogLevelEnv = "APEX_LOG_LEVEL";
 
 constexpr unsigned kMaxThreads = 256;
@@ -55,6 +58,15 @@ constexpr unsigned kMinLeaseTtlMs = 1000;
 constexpr unsigned kMaxLeaseTtlMs = 300000;
 constexpr unsigned kMinRedisTimeoutMs = 100;
 constexpr unsigned kMaxRedisTimeoutMs = 60000;
+// Waiter bounds (ms, ms, count). Timeout floor keeps "wait" meaningful
+// (below 1 s the waiter would almost always 202 spuriously); recheck floor
+// keeps fallback reads off the hot path; the per-key cap bounds registry
+// memory against abusive duplicate fan-in (§29).
+constexpr unsigned kMinWaiterTimeoutMs = 1000;
+constexpr unsigned kMaxWaiterTimeoutMs = 300000;
+constexpr unsigned kMinWaiterRecheckMs = 100;
+constexpr unsigned kMaxWaiterRecheckMs = 30000;
+constexpr unsigned kMaxWaitersPerKey = 100000;
 
 bool parse_port(const char* text, std::uint16_t& out) {
   if (text == nullptr || *text == '\0') {
@@ -203,6 +215,30 @@ std::pair<Config, std::vector<std::string>> Config::load_from_environment() {
       cfg.redis_op_timeout_ms = 2000;
     }
   }
+  if (const auto v = get_env(kWaiterTimeoutEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.waiter_timeout_ms, kMinWaiterTimeoutMs,
+                         kMaxWaiterTimeoutMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kWaiterTimeoutEnv +
+                            "; using default 30000.");
+      cfg.waiter_timeout_ms = 30000;
+    }
+  }
+  if (const auto v = get_env(kWaiterRecheckEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.waiter_recheck_ms, kMinWaiterRecheckMs,
+                         kMaxWaiterRecheckMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kWaiterRecheckEnv +
+                            "; using default 1000.");
+      cfg.waiter_recheck_ms = 1000;
+    }
+  }
+  if (const auto v = get_env(kMaxWaitersEnv); v && !v->empty()) {
+    if (!parse_bounded_count(v->c_str(), cfg.max_waiters_per_key, kMaxWaitersPerKey) ||
+        cfg.max_waiters_per_key < 1) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kMaxWaitersEnv +
+                            "; using default 1024.");
+      cfg.max_waiters_per_key = 1024;
+    }
+  }
   if (const auto v = get_env(kLogLevelEnv); v && !v->empty()) {
     cfg.log_level = *v;
   }
@@ -243,6 +279,15 @@ std::string Config::validate() const {
   }
   if (redis_op_timeout_ms < kMinRedisTimeoutMs || redis_op_timeout_ms > kMaxRedisTimeoutMs) {
     return "redis_op_timeout_ms must be in [100, 60000]";
+  }
+  if (waiter_timeout_ms < kMinWaiterTimeoutMs || waiter_timeout_ms > kMaxWaiterTimeoutMs) {
+    return "waiter_timeout_ms must be in [1000, 300000]";
+  }
+  if (waiter_recheck_ms < kMinWaiterRecheckMs || waiter_recheck_ms > kMaxWaiterRecheckMs) {
+    return "waiter_recheck_ms must be in [100, 30000]";
+  }
+  if (max_waiters_per_key < 1 || max_waiters_per_key > kMaxWaitersPerKey) {
+    return "max_waiters_per_key must be in [1, 100000]";
   }
   if (log_level != "debug" && log_level != "info" && log_level != "warning" &&
       log_level != "error") {

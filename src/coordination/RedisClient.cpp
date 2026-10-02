@@ -101,4 +101,39 @@ void RedisClient::del(const std::string& key) {
   }
 }
 
+long long RedisClient::publish(const std::string& channel, const std::string& message) {
+  try {
+    return redis_->publish(channel, message);
+  } catch (const sw::redis::Error& e) {
+    throw_redis("Redis PUBLISH failed", e);
+  }
+}
+
+void RedisClient::psubscribe_loop(const std::string& pattern, PatternMessageHandler on_message,
+                                  const std::atomic<bool>& stop) {
+  // A dedicated Subscriber borrows its own connection: pooling, timeouts,
+  // and auth come from the same options as commands. Callbacks fire on THIS
+  // thread and must never block it (registry dispatch only).
+  try {
+    sw::redis::Subscriber sub = redis_->subscriber();
+    sub.on_pmessage(
+        [&on_message](const std::string& matched, const std::string& channel,
+                      const std::string& message) { on_message(matched, channel, message); });
+    sub.psubscribe(pattern);
+    // Socket reads time out per socket_timeout, so consume() surfaces
+    // TimeoutError regularly: the stop flag is honored promptly and a dead
+    // server surfaces as an error instead of a silent hang. Either way the
+    // loop stays responsive without any sleep-based polling.
+    while (!stop.load()) {
+      try {
+        sub.consume();
+      } catch (const sw::redis::TimeoutError&) {
+        continue;  // Read timeout: re-check stop, keep the subscription.
+      }
+    }
+  } catch (const sw::redis::Error& e) {
+    throw_redis("Redis SUBSCRIBE failed", e);
+  }
+}
+
 }  // namespace apex::coordination

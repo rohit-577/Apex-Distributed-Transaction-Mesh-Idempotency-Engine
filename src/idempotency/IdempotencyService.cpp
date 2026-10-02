@@ -7,7 +7,9 @@
 #include <nlohmann/json.hpp>
 
 #include "coordination/LeaseManager.hpp"
-#include "idempotency/SimulatedOperation.hpp"
+#include "coordination/RedisClient.hpp"
+#include "idempotency/OperationExecutor.hpp"
+#include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/IdempotencyRepository.hpp"
@@ -47,9 +49,9 @@ class LeaseReleaser {
 
 std::string in_progress_body() {
   return nlohmann::json({{"status", "processing"},
-                         {"message", "Operation accepted and in progress. Retry with the same "
-                                     "Idempotency-Key to receive the result. (Waiter multiplexing "
-                                     "arrives in a later phase.)"}})
+                         {"message",
+                          "Operation accepted and in progress. Retry with the same "
+                          "Idempotency-Key to receive the result."}})
       .dump();
 }
 
@@ -98,9 +100,9 @@ std::string storage_unavailable_body() {
       .dump();
 }
 
-// Maps an already-read record to its non-executing outcome (replay /
-// conflict / failed-terminal / still-processing). Used by the main flow and
-// by every "lost a race, re-read" path so all answers come from one place.
+// Maps an already-read record to its non-executing outcome. PROCESSING with
+// our fingerprint yields WAIT (multiplexing): another generation owns the
+// operation and this caller must suspend, never execute (INV-MUX-01).
 OperationOutcome map_stored_record(const IdempotencyRecord& existing,
                                     const std::string& request_fingerprint) {
   OperationOutcome done;
@@ -112,9 +114,9 @@ OperationOutcome map_stored_record(const IdempotencyRecord& existing,
   }
   switch (existing.status) {
     case RecordStatus::Processing:
-      done.kind = OperationOutcome::Kind::InProgress;
-      done.http_status = 202;
-      done.body = in_progress_body();
+      done.kind = OperationOutcome::Kind::Wait;
+      done.http_status = 0;  // Not an HTTP verdict: the caller suspends.
+      done.body.clear();
       return done;
     case RecordStatus::Completed:
       done.kind = OperationOutcome::Kind::Replayed;
@@ -137,10 +139,8 @@ OperationOutcome map_stored_record(const IdempotencyRecord& existing,
 
 }  // namespace
 
-IdempotencyService::IdempotencyService(std::shared_ptr<persistence::ConnectionPool> pool,
-                                       observability::Logger& logger,
-                                       std::shared_ptr<coordination::LeaseManager> leases)
-    : pool_(std::move(pool)), logger_(logger), leases_(std::move(leases)) {}
+IdempotencyService::IdempotencyService(ServiceDependencies deps, observability::Logger& logger)
+    : deps_(std::move(deps)), logger_(logger) {}
 
 OperationOutcome IdempotencyService::handle(const OperationRequest& request) {
   const auto started = std::chrono::steady_clock::now();
@@ -159,18 +159,9 @@ OperationOutcome IdempotencyService::handle(const OperationRequest& request) {
     done.body = storage_unavailable_body();
     return done;
   };
-  const auto redis_failure = [&](const std::string& what) {
-    // Fail closed: without coordination we may NOT take ownership, but
-    // committed results stay replayable (those paths never reach here).
-    logger_.error("idempotency key=" + logged_key + " coordination failure: " + what);
-    done.kind = OperationOutcome::Kind::RedisUnavailable;
-    done.http_status = 503;
-    done.body = redis_unavailable_body();
-    return done;
-  };
 
   try {
-    persistence::ConnectionPool::Guard checkout = pool_->acquire();
+    persistence::ConnectionPool::Guard checkout = deps_.pool->acquire();
     persistence::PgConnection& db = checkout.connection();
     persistence::IdempotencyRepository repo;
 
@@ -184,8 +175,8 @@ OperationOutcome IdempotencyService::handle(const OperationRequest& request) {
       return map_stored_record(*first_read, request.fingerprint);
     }
 
-    if (leases_ == nullptr) {
-      return redis_failure("no lease manager wired");
+    if (deps_.leases == nullptr) {
+      return redis_unavailable(done, logged_key, "no lease manager wired");
     }
 
     if (!first_read.has_value()) {
@@ -203,22 +194,23 @@ OperationOutcome IdempotencyService::handle_first_request(
     const std::function<long long()>& elapsed_ms, OperationOutcome& done) {
   // CASE A: no durable row. The Redis lease decides who may create it; the
   // database decides the row. Neither system alone is sufficient.
-  const coordination::LeaseAttempt attempt = leases_->try_acquire(request.key);
+  const coordination::LeaseAttempt attempt = deps_.leases->try_acquire(request.key);
   if (attempt.result == coordination::LeaseAttempt::Result::RedisUnavailable) {
     // Fail closed BEFORE creating anything: no row, no orphan, safe retry.
     return redis_unavailable(done, logged_key);
   }
   if (attempt.result == coordination::LeaseAttempt::Result::HeldByOther) {
     // Crash window A: a previous holder took the lease but never inserted
-    // (or hasn't committed yet). Its generation owns the key right now, so
-    // we answer "in progress" without creating a rival row.
+    // (or hasn't committed yet). Its generation owns the key right now and
+    // there is no durable row to wait on, so defer without creating a rival
+    // row. The retry converges once the row exists.
     logger_.info("idempotency key=" + logged_key + " lease held with no durable row (202)");
     done.kind = OperationOutcome::Kind::InProgress;
     done.http_status = 202;
     done.body = in_progress_body();
     return done;
   }
-  LeaseReleaser releaser(leases_.get(), request.key, attempt.token);
+  LeaseReleaser releaser(deps_.leases.get(), request.key, attempt.token);
 
   const persistence::AcquireResult acquired = repo.try_acquire(db, request.key,
                                                               request.fingerprint);
@@ -240,37 +232,45 @@ OperationOutcome IdempotencyService::handle_processing_seen(
     const std::string& logged_key, const std::function<long long()>& elapsed_ms,
     OperationOutcome& done) {
   // CASE B/C: PROCESSING row, same fingerprint. The Redis key tells liveness:
-  // present => an owner is (or may still be) active => 202, non-waiting.
-  // Absent is only a HINT (INV-09): the epoch CAS below decides ownership.
+  // present => an owner is (or may still be) active => WAIT for it (the
+  // caller suspends; multiplexing, INV-MUX-01). Absent is only a HINT
+  // (INV-09): the epoch CAS below decides ownership.
   bool held = false;
   try {
-    held = leases_->is_held(request.key);
+    held = deps_.leases->is_held(request.key);
   } catch (const std::exception& e) {
     return redis_unavailable(done, logged_key, e.what());
   }
   if (held) {
     logger_.info("idempotency key=" + logged_key + " fp=" + request.fingerprint +
-                 " duplicate-while-PROCESSING owner-active latency_ms=" +
+                 " duplicate-while-PROCESSING owner-active => wait latency_ms=" +
                  std::to_string(elapsed_ms()));
-    done.kind = OperationOutcome::Kind::InProgress;
-    done.http_status = 202;
-    done.body = in_progress_body();
+    done.kind = OperationOutcome::Kind::Wait;
+    done.http_status = 0;
+    done.body.clear();
     return done;
   }
 
-  const coordination::LeaseAttempt attempt = leases_->try_acquire(request.key);
+  const coordination::LeaseAttempt attempt = deps_.leases->try_acquire(request.key);
   if (attempt.result == coordination::LeaseAttempt::Result::RedisUnavailable) {
     return redis_unavailable(done, logged_key);
   }
   if (attempt.result == coordination::LeaseAttempt::Result::HeldByOther) {
-    // Lost the lease race after seeing no lease: someone just took it.
-    // They own recovery now; we answer from the durable state.
-    done.kind = OperationOutcome::Kind::InProgress;
-    done.http_status = 202;
-    done.body = in_progress_body();
-    return done;
+    // Lost the lease race after seeing no lease: whoever took it owns
+    // recovery now. Re-read the durable row instead of assuming: it may
+    // already be terminal (respond from it) or still PROCESSING (wait on
+    // the new holder). Never 202 blindly — the state may have moved.
+    const std::optional<IdempotencyRecord> fresh = repo.find_by_key(db, request.key);
+    if (!fresh.has_value()) {
+      logger_.error("idempotency key=" + logged_key + " lost lease race and row vanished");
+      done.kind = OperationOutcome::Kind::StorageUnavailable;
+      done.http_status = 503;
+      done.body = storage_unavailable_body();
+      return done;
+    }
+    return map_stored_record(*fresh, request.fingerprint);
   }
-  LeaseReleaser releaser(leases_.get(), request.key, attempt.token);
+  LeaseReleaser releaser(deps_.leases.get(), request.key, attempt.token);
   return recover_with_lease(db, repo, request, observed, logged_key, elapsed_ms, done);
 }
 
@@ -318,7 +318,7 @@ OperationOutcome IdempotencyService::execute_owned(
   // The terminal write presents our epoch IN the predicate: if recovery
   // advanced past us while we ran, we affect zero rows and our result is
   // discarded (FENCING INVARIANT) — never merged, never overwritten.
-  const SimulatedResult op = run_simulated(request.canonical_body);
+  const ExecutionResult op = deps_.executor->execute(request.canonical_body);
   const bool transitioned = op.success
                                 ? repo.complete(db, request.key, request.fingerprint, epoch,
                                                 op.http_status, op.body, op.content_type)
@@ -336,11 +336,40 @@ OperationOutcome IdempotencyService::execute_owned(
                " transition=PROCESSING->" + (op.success ? "COMPLETED" : "FAILED") +
                " epoch=" + std::to_string(epoch) +
                " latency_ms=" + std::to_string(elapsed_ms()));
+  broadcast_completion(request.key, request.fingerprint, logged_key);
   done.kind = executed_kind;
   done.http_status = op.http_status;
   done.body = op.body;
   done.content_type = op.content_type;
   return done;
+}
+
+void IdempotencyService::broadcast_completion(const std::string& key,
+                                              const std::string& fingerprint,
+                                              const std::string& logged_key) {
+  // Owner completion order (§14): the durable commit above is already done,
+  // so notification is pure wake-up from here on. Publish first (cross-node
+  // waiters), then local registry (same-process waiters); EITHER may fail
+  // or be missed without harming correctness, because every woken waiter
+  // re-reads PostgreSQL and every unwoken waiter falls back to its timer.
+  // Publish is best-effort: a RedisError here must NOT fail the committed
+  // operation (CASE 1 of the failure matrix).
+  const std::string channel = WaiterRegistry::channel_for(key, fingerprint);
+  if (deps_.redis != nullptr) {
+    try {
+      const long long receivers = deps_.redis->publish(channel, "");
+      logger_.debug("idempotency key=" + logged_key + " published completion receivers=" +
+                    std::to_string(receivers));
+    } catch (const std::exception& e) {
+      logger_.warning("idempotency key=" + logged_key +
+                      " completion publish failed (waiters fall back to recheck): " + e.what());
+    }
+  }
+  if (deps_.registry != nullptr) {
+    const std::size_t woken = deps_.registry->notify(channel);
+    logger_.debug("idempotency key=" + logged_key +
+                  " local waiters woken=" + std::to_string(woken));
+  }
 }
 
 OperationOutcome IdempotencyService::redis_unavailable(OperationOutcome& done,

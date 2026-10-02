@@ -219,8 +219,7 @@ TEST_F(PgFixture, RedisDownDuringOwnershipAttemptFailsClosed) {
   apex::observability::Logger quiet(apex::observability::Level::Error);
   auto dead_leases = std::make_shared<coordination::LeaseManager>(
       dead_redis, std::chrono::milliseconds(10000), quiet);
-  auto dead_service =
-      std::make_shared<idempotency::IdempotencyService>(shared_pool(), quiet, dead_leases);
+  auto dead_service = make_service(shared_pool(), quiet, dead_leases);
 
   test::TestServer server(cross_config(), dead_service);
 
@@ -260,8 +259,7 @@ TEST_F(PgFixture, PostgresFailureDuringOwnershipFailsSafe) {
             " dbname=apex user=apex connect_timeout=2 application_name=apex-test",
         /*max_size=*/2);
     apex::observability::Logger quiet(apex::observability::Level::Error);
-    auto dead_pg_service = std::make_shared<idempotency::IdempotencyService>(
-        dead_pool, quiet, shared_leases());
+    auto dead_pg_service = make_service(dead_pool, quiet, shared_leases());
     test::TestServer server(cross_config(), dead_pg_service);
     const std::string key = unique_key("case6-down");
     const test::HttpResult refused = post_key(server.port(), key, R"({"s":6})");

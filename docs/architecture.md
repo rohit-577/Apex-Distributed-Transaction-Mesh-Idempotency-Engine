@@ -10,19 +10,21 @@ and failure. It is not a CRUD app and not a generic REST API: every design
 choice serves the question "what happens when the same write arrives twice,
 at the same time, while machines fail?"
 
-## Phase 2 scope (this document describes intent + current status)
+## Phase 3 scope (this document describes intent + current status)
 
-Phase 2 adds **lease-based ownership and durable fencing**: single-instance
-Redis leases (`SET NX PX` + token-guarded Lua release), cryptographic owner
-tokens, `fencing_epoch` generations in PostgreSQL (V002), epoch-guarded
-terminal writes, and orphan recovery. Full mechanics in
+Phase 3 adds **in-flight request multiplexing**: duplicates of an active
+owner suspend asynchronously (no thread held) and converge on the owner's
+durable result via a process-local waiter registry, Redis pub/sub wake-up
+(wake-only), and fallback durable re-checks. Full mechanics below and in
 `docs/lease-and-fencing.md`.
 
-Explicitly NOT in Phase 2 (later phases): pub/sub notification, waiter
-multiplexing (active-owner duplicates still get `202`), Redlock/quorum,
-renewal, background orphan reaping, multi-node load balancing. This phase
-provides **durable idempotency with lease-based ownership and fencing** —
-not distributed exactly-once execution (see INV-10 and §11 of
+Explicitly NOT in Phase 3 (later phases): Redlock/quorum, Streams, renewal,
+background orphan reaping, metrics/tracing, TLS/auth. Multiplexing changes
+duplicate-while-PROCESSING from "202 immediately" to "wait, then the final
+result" — the 202 remains only for timeouts, shutdown, caps, and the no-row
+window-A case. This phase provides **durable idempotency with lease-based
+ownership, fencing, and single-execution fan-in** — not distributed
+exactly-once execution (see INV-10 and §11 of
 `docs/lease-and-fencing.md`).
 
 ## Topology today (Implemented, Validated)
@@ -41,13 +43,16 @@ IdempotencyService -> IdempotencyRepository -> PostgreSQL 18 (libpq)
       |       |             (durable authority, INV-08/INV-17, INV-20)
       |       +----------> LeaseManager -> RedisClient -> Redis 7 (redis-plus-plus)
       |                        (liveness only: apex:lease:<key>, TTL, tokens)
-      v
-SimulatedOperation (deterministic stand-in for real work)
+      |       +----------> WaiterRegistry (process-local waiter slots)
+      |       +----------> publish completion -> apex:w:<hash> (wake-only)
+      v                    CompletionSubscriber (one thread, psubscribe
+SimulatedOperation          apex:w:*, reconnect sweep) -> registry -> sessions
+  (or injected test executor; counts executions deterministically)
 ```
 
-Redis holds lease liveness (single `redis:7` dev instance — stated plainly,
-not Redlock). Nothing replayable depends on it: terminal answers come from
-PostgreSQL without touching Redis.
+Redis holds lease liveness plus wake-up fan-out (single `redis:7` dev
+instance — stated plainly, not Redlock). Nothing replayable depends on it:
+terminal answers come from PostgreSQL without touching Redis.
 
 ## Module boundaries (Implemented unless marked)
 
@@ -57,11 +62,11 @@ PostgreSQL without touching Redis.
 | Config | `src/config/` | Env-based config + validation + libpq conninfo builder. Only module that reads the environment. | Implemented |
 | API routing | `src/api/` | Pure (method, target) → result mapping. No I/O, no state. Does NOT own `/ready` or `/v1/operations` (dispatched by Session first). | Implemented |
 | Execution | `src/execution/` | `HttpServer` (accept loop), `Session` (connection + async dispatch to service/DB pool), `DependencyChecker` (async probes). No business logic. | Implemented |
-| Idempotency | `src/idempotency/` | Key rules, fingerprinting, simulated op, orchestration service. No sockets, no SQL. | Implemented |
+| Idempotency | `src/idempotency/` | Key rules, fingerprinting, operation-executor seam, orchestration service, process-local waiter registry (optimization only). No sockets, no SQL. | Implemented |
 | Persistence | `src/persistence/` | `PgConnection` (RAII libpq), `ConnectionPool` (bounded checkout), `IdempotencyRepository` (the only SQL), `Schema` (migration applier). No HTTP, no orchestration. | Implemented |
 | Observability | `src/observability/` | Tiny thread-safe stderr logger + transition logging with key-truncation policy (below). | Implemented |
 | Core | `src/core/` | Phase constants. | Implemented (minimal) |
-| Coordination | `src/coordination/` | `RedisClient` (only Redis connections in the codebase), `LeaseManager` (`SET NX PX`, Lua compare-delete, owner tokens). No pub/sub yet. | Implemented |
+| Coordination | `src/coordination/` | `RedisClient` (only Redis connections in the codebase), `LeaseManager` (`SET NX PX`, Lua compare-delete, owner tokens), `CompletionSubscriber` (one thread, pattern-subscribe wake-ups, reconnect sweep). No Streams, no Cluster. | Implemented |
 | Concurrency | `src/concurrency/` | In-flight map, waiter multiplexing. | Planned (later phase) |
 
 Rules: I/O threads never block (DB *and* Redis work hop to the pool and
@@ -91,8 +96,9 @@ global mutable state anywhere.
 |---|---|
 | Missing / invalid key, invalid JSON | `400` with a machine-readable `error` |
 | First request (lease won, epoch 1) | Executes now → `200` (or `500` when the op itself fails) |
-| Duplicate, same fingerprint, lease held (active owner) | `202 {"status":"processing"}` — deliberate, no waiting |
-| Duplicate, same fingerprint, lease free (orphan) | Recovers to epoch N+1, executes → `200` |
+| Duplicate, same fingerprint, active owner | Waits (no thread held) → owner's final result, byte-identical for all |
+| Duplicate, same fingerprint, orphaned | Recovers to epoch N+1, executes → `200` (fellow waiters converge too) |
+| Waiter exceeds deadline / shutdown / cap / no-row window | `202 {"status":"processing"}` — transient; durable state untouched |
 | Duplicate, same fingerprint, `COMPLETED` | Stored `http_status` + body replayed byte-identically (no Redis touched) |
 | Duplicate, same fingerprint, `FAILED` | `409 idempotency_already_failed` with the original failure |
 | Superseded owner commits late | `409 stale_ownership_epoch`; current result stands |
@@ -111,14 +117,20 @@ accept -> Session::do_read (30 s idle timeout, 1 MiB body cap)
   -> POST /v1/operations?
        validate key/fingerprint inline (pure CPU)
        service missing? 503
-       post blocking service->handle() to DB pool, suspend (INV-01)
-       resume on session executor -> respond 200/202/400/409/500/503 JSON
+       post blocking service->handle() to DB pool (INV-01)
+       verdict terminal/conflict/stale/unavailable? respond now
+       verdict WAIT? register in WaiterRegistry + arm ONE timer
+         (min(recheck, remaining)), suspend with NO thread held
+         wake (local notify / pub-sub / timer) -> re-run handle() on pool
+         terminal? respond identical bytes : still owned? re-arm : 202 on deadline
   -> else Router    -> 200 / 404 / 405 JSON
   -> keep-alive?    next read : close
 ```
 
-Shutdown order: stop acceptor → stop `io_context` → join I/O workers →
-join DB pool → close connection pool. Each stage outlives its users.
+Shutdown order: stop acceptor → registry shutdown (waiters 202 while the
+loop runs) → subscriber stop/join → stop `io_context` → join I/O workers →
+join DB pool → close pools. Each stage outlives its users; timer aborts
+settle-destroy sessions that outlive the loop.
 
 ## Logging policy (Implemented)
 
@@ -173,8 +185,31 @@ enough to correlate, the fingerprint is enough to identify the request.
    decide correctness; the two-file ordered migration list stays until the
    count justifies a runner.
 
+## Decisions made in Phase 3
+
+1. **Wait verdict + async session loop, not blocking waits.** `handle()`
+   stays fast and non-waiting; the Session suspends on a registry slot +
+   one Asio timer and re-invokes the SAME decision engine per cycle — so
+   waiters that observe a dead owner transparently become recoverers, with
+   no second code path to drift.
+2. **Register-then-always-recheck (no completed flags).** An earlier design
+   remembered notified slots; it failed review (a completion with zero
+   waiters left no trace for late registrants). The mandatory immediate
+   re-check after every registration closes the race unconditionally and
+   deletes an entire class of state.
+3. **One subscriber thread, pattern subscription, reconnect sweep.** A
+   dedicated `sw::redis::Subscriber` connection (commands untouched);
+   socket-read timeouts bound stop latency; every reconnect sweeps all
+   waiters to re-check (missed-notification windows become immediate
+   convergence instead of hangs).
+4. **Operation-executor seam.** Counting/gated test executors prove
+   exactly-once fan-in without touching production paths; the seam is
+   independently justified (real operations will replace simulation).
+5. **Timeout/recheck/cap configuration.** 30 s / 1 s / 1024 defaults;
+   timeouts answer 202 and mutate nothing.
+
 ## Deliberately deferred
 
-- Redis pub/sub/streams, waiter registry/multiplexing, renewal, Redlock or
+- Redis Streams, renewal, Redlock or
   any multi-instance Redis, background orphan reaping, key expiry/GC,
   metrics/tracing, TLS, auth, rate limiting, benchmarks.

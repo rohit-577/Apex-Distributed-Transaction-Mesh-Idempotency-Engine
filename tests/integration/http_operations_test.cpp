@@ -142,10 +142,11 @@ TEST_F(PgFixture, CompletedDuplicateReplaysStoredResult) {
 }
 
 TEST_F(PgFixture, DuplicateWhileProcessingGets202) {
-  // CASE B: a PROCESSING row whose owner still holds the Redis lease is an
-  // ACTIVE operation. The duplicate gets 202 without waiting (multiplexing
-  // is a later phase) and, crucially, no recovery is attempted: the epoch
-  // stays 1 and nothing executes.
+  // CASE B with an owner that never finishes: the duplicate waits (active
+  // lease held) and the waiter timeout answers 202 with the durable row
+  // untouched — same observable 202 as before, now reached by waiting
+  // rather than by refusing to wait. (Multiplexing convergence itself is
+  // covered by the P3 suite with completing owners.)
   REQUIRE_PG();
   REQUIRE_REDIS();
   const std::string key = unique_key("processing");
@@ -208,8 +209,7 @@ TEST_F(PgFixture, NullLeasesFailClosedWithoutCreatingOrphans) {
   // created — fail-closed must not orphan PROCESSING rows.
   REQUIRE_PG();
   apex::observability::Logger quiet(apex::observability::Level::Error);
-  auto leaseless = std::make_shared<idempotency::IdempotencyService>(
-      shared_pool(), quiet, /*leases=*/nullptr);
+  auto leaseless = make_service(shared_pool(), quiet, /*leases=*/nullptr);
   test::TestServer server(ops_config(), leaseless);
 
   const std::string key = unique_key("nolease");
@@ -275,8 +275,7 @@ TEST_F(PgFixture, UnreachableDatabaseIs503) {
           " dbname=apex user=apex connect_timeout=2 application_name=apex-test",
       /*max_size=*/2);
   apex::observability::Logger quiet(apex::observability::Level::Error);
-  auto dead_service =
-      std::make_shared<idempotency::IdempotencyService>(dead_pool, quiet);
+  auto dead_service = make_service(dead_pool, quiet, /*leases=*/nullptr);
   // NOTE: dead_pool must outlive the server (service holds it too).
   test::TestServer server(cfg, dead_service);
 

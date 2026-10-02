@@ -8,16 +8,17 @@
 // call (repository + lease + simulated operation) that must run on a worker
 // thread — Session posts it to the DB pool and suspends (INV-01). One
 // service instance is shared by all sessions; everything it touches (pool,
-// leases, logger) is thread-safe and it keeps no request state, so
-// concurrent handle() calls are independent. Authority stays in PostgreSQL
-// either way (INV-17); Redis only ever decides liveness.
+// leases, executor, registry, redis, logger) is thread-safe and it keeps no
+// request state, so concurrent handle() calls are independent. Authority
+// stays in PostgreSQL either way (INV-17); Redis only ever decides liveness.
 //
-// Ownership model (Phase 2):
+// Ownership model (Phase 2, preserved):
 //   CASE A (no record):            win the Redis lease, then INSERT epoch 1.
 //                                  Redis down or lease held => NO row is
 //                                  created (fail closed, 503/202).
-//   CASE B (PROCESSING, owner      lease key present => active owner => 202,
-//          active):                non-waiting (multiplexing is later).
+//   CASE B (PROCESSING, owner      lease key present => the owner is (or may
+//          active):                still be) active => WAIT (Phase 3: the
+//                                  waiter suspends; multiplexing arrives here).
 //   CASE C (PROCESSING, lease      win the lease, then CAS the fencing epoch
 //          expired):               previous+1. Exactly one recoverer wins
 //                                  per observed epoch (INV-19).
@@ -27,19 +28,22 @@
 // superseded generation affects zero rows (FENCING INVARIANT) and its
 // result is discarded, never merged.
 //
+// Multiplexing model (Phase 3): handle() never blocks waiting. When the
+// verdict is "another generation owns this", it returns Wait immediately;
+// the caller (Session) suspends asynchronously and re-invokes handle() on
+// wake/timeout/fallback — the SAME decision engine, so waiters that observe
+// a dead owner transparently become recoverers. Owner completion
+// broadcasts (publish + local notify) AFTER the durable commit; waiters
+// always re-read PostgreSQL before answering (INV-MUX-03/04).
+//
 // Outcome contract (HTTP mapping lives in Session, kinds here):
-// - Executed: first execution finished now (HTTP 200 or 500 from the op).
-// - Recovered: executed as a recovery generation (epoch > 1). Same HTTP
-//   shape as Executed; distinguished for logs/tests.
-// - Replayed / InProgress / FingerprintConflict / FailedTerminal: Phase 1
-//   meanings, unchanged.
-// - StaleEpoch: our generation was superseded before our terminal write
-//   landed (HTTP 409 stale_ownership_epoch). Our result is discarded; the
-//   current generation's result stands.
-// - RedisUnavailable: coordination unreachable; fail closed (HTTP 503
-//   redis_unavailable). No row created, no write attempted.
-// - StorageUnavailable: PostgreSQL unreachable (HTTP 503
-//   storage_unavailable).
+// - Executed / Recovered: this call executed (epoch 1 / epoch > 1).
+// - Wait: another generation owns the operation; caller should suspend and
+//   re-invoke (NOT an HTTP status).
+// - Replayed / InProgress / FingerprintConflict / FailedTerminal: Phase 2
+//   meanings. InProgress now only covers "lease held but NO durable row"
+//   (crash window A) — observed PROCESSING always waits instead.
+// - StaleEpoch / RedisUnavailable / StorageUnavailable: unchanged.
 
 #include <cstdint>
 #include <functional>
@@ -59,9 +63,13 @@ struct IdempotencyRecord;
 
 namespace apex::coordination {
 class LeaseManager;
-}
+class RedisClient;
+}  // namespace apex::coordination
 
 namespace apex::idempotency {
+
+class OperationExecutor;
+class WaiterRegistry;
 
 struct OperationRequest {
   std::string key;
@@ -73,6 +81,7 @@ struct OperationOutcome {
   enum class Kind {
     Executed,
     Recovered,
+    Wait,
     Replayed,
     InProgress,
     FingerprintConflict,
@@ -88,18 +97,30 @@ struct OperationOutcome {
   std::string content_type{"application/json"};
 };
 
+struct ServiceDependencies {
+  std::shared_ptr<persistence::ConnectionPool> pool;
+  // Nullable: any path needing a lease decision answers RedisUnavailable.
+  std::shared_ptr<coordination::LeaseManager> leases;
+  std::shared_ptr<OperationExecutor> executor;
+  std::shared_ptr<WaiterRegistry> registry;
+  // Publish path for completion broadcast (shared with LeaseManager's
+  // client in production; BEST-EFFORT — publish failure never fails the
+  // already-committed operation).
+  std::shared_ptr<coordination::RedisClient> redis;
+};
+
 class IdempotencyService {
  public:
-  // `leases` may be null (storage-only wiring): any path needing a lease
-  // decision then answers RedisUnavailable instead of proceeding.
-  IdempotencyService(std::shared_ptr<persistence::ConnectionPool> pool,
-                     observability::Logger& logger,
-                     std::shared_ptr<coordination::LeaseManager> leases = nullptr);
+  IdempotencyService(ServiceDependencies deps, observability::Logger& logger);
 
-  // BLOCKING: performs lease + repository transactions and the simulated
-  // operation on the caller's thread. Never throws: every failure maps to
-  // an outcome (worker threads must never see an exception).
+  // BLOCKING: performs lease + repository transactions and the operation
+  // on the caller's thread. Never throws: every failure maps to an outcome
+  // (worker threads must never see an exception). Never WAITS: an owned
+  // operation elsewhere yields Wait for the caller to suspend on.
   [[nodiscard]] OperationOutcome handle(const OperationRequest& request);
+
+  // Shared waiter registry (Session drives async waiting through it).
+  [[nodiscard]] std::shared_ptr<WaiterRegistry> registry() const { return deps_.registry; }
 
  private:
   // CASE A: no durable row. Wins the Redis lease, then creates epoch 1 —
@@ -111,7 +132,7 @@ class IdempotencyService {
                                         const std::function<long long()>& elapsed_ms,
                                         OperationOutcome& done);
 
-  // CASE B/C: PROCESSING row with our fingerprint. Lease present => 202;
+  // CASE B/C: PROCESSING row with our fingerprint. Lease present => Wait;
   // lease absent => attempt recovery with the observed epoch.
   OperationOutcome handle_processing_seen(persistence::PgConnection& db,
                                           persistence::IdempotencyRepository& repo,
@@ -131,8 +152,9 @@ class IdempotencyService {
                                       const std::function<long long()>& elapsed_ms,
                                       OperationOutcome& done);
 
-  // Runs the operation and commits with `epoch` in the SQL predicate.
-  // `executed_kind` is Executed (epoch 1) or Recovered (epoch > 1).
+  // Runs the operation and commits with `epoch` in the SQL predicate, then
+  // broadcasts completion (publish + local notify, best-effort, AFTER the
+  // commit). `executed_kind` is Executed (epoch 1) or Recovered (epoch > 1).
   OperationOutcome execute_owned(persistence::PgConnection& db,
                                  persistence::IdempotencyRepository& repo,
                                  const OperationRequest& request, std::int64_t epoch,
@@ -143,10 +165,13 @@ class IdempotencyService {
   OperationOutcome redis_unavailable(OperationOutcome& done, const std::string& logged_key,
                                      const std::string& what = "coordination unreachable");
 
- private:
-  std::shared_ptr<persistence::ConnectionPool> pool_;
+  // Post-commit broadcast: best-effort Redis publish + local registry
+  // notify. Never throws; never affects the committed result.
+  void broadcast_completion(const std::string& key, const std::string& fingerprint,
+                            const std::string& logged_key);
+
+  ServiceDependencies deps_;
   observability::Logger& logger_;
-  std::shared_ptr<coordination::LeaseManager> leases_;
 };
 
 }  // namespace apex::idempotency

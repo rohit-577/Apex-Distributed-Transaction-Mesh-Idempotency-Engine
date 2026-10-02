@@ -1,16 +1,16 @@
 # Apex Testing Strategy
 
-Status: **unit / integration / concurrency Implemented and passing (103
-tests), including the live-PostgreSQL + live-Redis matrix; waiter
-multiplexing tests and benchmark harnesses Planned.**
+Status: **unit / integration / concurrency Implemented and passing (133
+tests), including the live-PostgreSQL + live-Redis multiplexing matrix;
+benchmark harnesses Planned.**
 
 ## Layers
 
 | Layer | Location | What it proves | Needs Docker? |
 |---|---|---|---|
-| Unit | `tests/unit/` | Pure logic: config, routing, key rules, canonical JSON, fingerprints (incl. FIPS vector), simulated op, status parsing, lease namespace/token contract, log-safety policy. Hermetic. | No |
-| Integration | `tests/integration/` | Real sockets: status codes, JSON, `/ready` 200/503, malformed survival, keep-alive. Real PostgreSQL: acquire/find/complete/fail, epoch CAS, terminal guards, rollback, CHECK constraints, pool recycling, conn failure, backend-kill. Real Redis: ping, acquire, contention, TTL expiry, safe release, outage. Full operations semantics over HTTP incl. recovery/stale/fail-closed. | Only `PgFixture` tests (self-skip without `APEX_TEST_POSTGRES_CONN` / `APEX_TEST_REDIS_HOST`; R7 outage test is hermetic) |
-| Concurrency | `tests/concurrency/` | 32-client health baseline + 2/50/100-way fan-in, fingerprint races, concurrent recovery (one winner), multi-key parallelism, owner-vs-recovery races. Barrier-coordinated (`std::latch`), never sleeps. | Races need live PG+Redis (skip otherwise) |
+| Unit | `tests/unit/` | Pure logic: config, routing, key rules, canonical JSON, fingerprints (incl. FIPS vector), simulated op, status parsing, lease namespace/token contract, log-safety policy, waiter-registry mechanics, channel mapping. Hermetic. | No |
+| Integration | `tests/integration/` | Real sockets: status codes, JSON, `/ready` 200/503, malformed survival, keep-alive. Real PostgreSQL: acquire/find/complete/fail, epoch CAS, terminal guards, rollback, CHECK constraints, pool recycling, conn failure, backend-kill. Real Redis: ping, acquire, contention, TTL expiry, safe release, outage, pub/sub delivery + stop. Waiter lifecycle: replay/failure/conflict without execution, missed-notification fallback, Redis-down behavior, waiter timeout, shutdown with waiters. Full operations semantics over HTTP incl. recovery/stale/fail-closed. | Only `PgFixture` tests (self-skip without `APEX_TEST_POSTGRES_CONN` / `APEX_TEST_REDIS_HOST`; R7 outage + registry tests are hermetic) |
+| Concurrency | `tests/concurrency/` | 32-client health baseline + 2/50/100-way ownership races AND 2/50/100-way multiplexed fan-in (execution counts), fingerprint races, concurrent recovery (one winner), multi-key parallelism, owner-vs-recovery races, cross-node duplicates (live pub/sub + deaf-subscriber fallback). Barrier-coordinated (`std::latch`), state-polled (`wait_until`), never sleeps. | Multiplexing races need live PG+Redis (skip otherwise) |
 | Failure (DB scope) | `tests/integration/db_repository_test.cpp` | Rollback, duplicate-insert race (23505), malformed rows (23514), invalid transitions, unreachable DB. Each ends in a verified consistent state. | Same gating as above |
 | Failure (cross-system) | `tests/integration/cross_system_test.cpp` | Lease-without-row, epoch-without-execution, T1–T7 stale-owner race, Redis-down ownership, PG-kill mid-transaction. Each names expected state, retry safety, recoverability. | Live PG+Redis |
 | Failure (distributed) | `tests/failure/` (Planned) | Partitions, multi-node sieges (beyond single-instance scope). | Yes for full-matrix runs |

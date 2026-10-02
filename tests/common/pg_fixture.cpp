@@ -2,10 +2,14 @@
 
 #include <chrono>
 
+#include "common/test_executor.hpp"
 #include "common/test_helpers.hpp"
+#include "coordination/CompletionSubscriber.hpp"
 #include "coordination/LeaseManager.hpp"
 #include "coordination/RedisClient.hpp"
 #include "idempotency/IdempotencyService.hpp"
+#include "idempotency/OperationExecutor.hpp"
+#include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/PgConnection.hpp"
@@ -24,6 +28,21 @@ std::optional<std::string> PgFixture::s_redis_host;
 std::uint16_t PgFixture::s_redis_port{6379};
 std::shared_ptr<coordination::RedisClient> PgFixture::s_redis;
 std::shared_ptr<coordination::LeaseManager> PgFixture::s_leases;
+std::shared_ptr<idempotency::WaiterRegistry> PgFixture::s_registry;
+std::shared_ptr<idempotency::OperationExecutor> PgFixture::s_executor;
+std::shared_ptr<coordination::CompletionSubscriber> PgFixture::s_subscriber;
+
+idempotency::WaiterOptions PgFixture::test_waiter_options() {
+  // Fast tests, honest semantics: short fallback interval exercises the
+  // re-check path quickly; the 5 s timeout only fires in tests that
+  // deliberately outlast it (P3-13 overrides it explicitly). Production
+  // defaults are far more conservative (see Config).
+  idempotency::WaiterOptions options;
+  options.timeout_ms = 5000;
+  options.recheck_ms = 100;
+  options.max_waiters_per_key = 1024;
+  return options;
+}
 
 bool PgFixture::pg_available() { return s_conninfo.has_value(); }
 bool PgFixture::redis_available() { return s_redis_host.has_value(); }
@@ -46,10 +65,7 @@ void PgFixture::SetUpTestSuite() {
   s_pool = std::make_shared<persistence::ConnectionPool>(*s_conninfo, /*max_size=*/16);
   if (s_redis_host) {
     // Short timeouts in tests: a dead Redis must fail fast, never stall the
-    // suite. Generous 10 s lease TTL mirrors production default. The pool is
-    // sized for the burst tests (50–100 simultaneous contenders); this is
-    // environmental headroom, not production sizing (default 8, documented
-    // in docs/architecture.md).
+    // suite. Generous 10 s lease TTL mirrors production default.
     coordination::RedisEndpoint endpoint;
     endpoint.host = *s_redis_host;
     endpoint.port = s_redis_port;
@@ -60,8 +76,84 @@ void PgFixture::SetUpTestSuite() {
     s_leases = std::make_shared<coordination::LeaseManager>(
         s_redis, std::chrono::milliseconds(10000), *s_logger);
   }
-  s_service =
-      std::make_shared<idempotency::IdempotencyService>(s_pool, *s_logger, s_leases);
+  s_registry = std::make_shared<idempotency::WaiterRegistry>(test_waiter_options());
+  s_executor = std::make_shared<idempotency::SimulatedExecutor>();
+  idempotency::ServiceDependencies deps;
+  deps.pool = s_pool;
+  deps.leases = s_leases;
+  deps.executor = s_executor;
+  deps.registry = s_registry;
+  deps.redis = s_redis;
+  s_service = std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
+  // Stopped until a test explicitly needs cross-node wake-up. Same-process
+  // waiting works through the local registry without it.
+  s_subscriber = std::make_shared<coordination::CompletionSubscriber>(s_redis, *s_registry,
+                                                                      *s_logger);
+}
+
+PgFixture::NodeBundle::~NodeBundle() {
+  if (subscriber != nullptr) {
+    subscriber->stop();
+  }
+}
+
+PgFixture::NodeBundle PgFixture::make_node(bool gate_open) {
+  return make_node_with_options(test_waiter_options(), gate_open);
+}
+
+PgFixture::NodeBundle PgFixture::make_node_with_executor(
+    std::shared_ptr<GatedExecutor> executor, const idempotency::WaiterOptions& options) {
+  NodeBundle node;
+  node.registry = std::make_shared<idempotency::WaiterRegistry>(options);
+  node.executor = std::move(executor);
+  idempotency::ServiceDependencies deps;
+  deps.pool = s_pool;
+  deps.leases = s_leases;
+  deps.executor = node.executor;
+  deps.registry = node.registry;
+  deps.redis = s_redis;
+  node.service =
+      std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
+  node.subscriber = std::make_shared<coordination::CompletionSubscriber>(
+      s_redis, *node.registry, *s_logger);
+  return node;
+}
+
+PgFixture::NodeBundle PgFixture::make_node_with_options(
+    const idempotency::WaiterOptions& options, bool gate_open) {
+  NodeBundle node;
+  node.registry = std::make_shared<idempotency::WaiterRegistry>(options);
+  node.executor = std::make_shared<GatedExecutor>(gate_open);
+  idempotency::ServiceDependencies deps;
+  deps.pool = s_pool;
+  deps.leases = s_leases;
+  deps.executor = node.executor;
+  deps.registry = node.registry;
+  deps.redis = s_redis;
+  node.service =
+      std::make_shared<idempotency::IdempotencyService>(std::move(deps), *s_logger);
+  node.subscriber = std::make_shared<coordination::CompletionSubscriber>(
+      s_redis, *node.registry, *s_logger);
+  return node;
+}
+
+std::shared_ptr<idempotency::IdempotencyService> PgFixture::make_service(
+    std::shared_ptr<persistence::ConnectionPool> pool, observability::Logger& logger,
+    std::shared_ptr<coordination::LeaseManager> leases,
+    std::shared_ptr<idempotency::OperationExecutor> executor,
+    std::shared_ptr<idempotency::WaiterRegistry> registry,
+    std::shared_ptr<coordination::RedisClient> redis) {
+  idempotency::ServiceDependencies deps;
+  deps.pool = std::move(pool);
+  deps.leases = std::move(leases);
+  deps.executor = executor != nullptr
+                      ? std::move(executor)
+                      : std::make_shared<idempotency::SimulatedExecutor>();
+  deps.registry = registry != nullptr
+                      ? std::move(registry)
+                      : std::make_shared<idempotency::WaiterRegistry>(test_waiter_options());
+  deps.redis = redis != nullptr ? std::move(redis) : s_redis;
+  return std::make_shared<idempotency::IdempotencyService>(std::move(deps), logger);
 }
 
 void PgFixture::SetUp() {
@@ -97,7 +189,11 @@ void PgFixture::TearDown() {
 
 std::string PgFixture::unique_key(const std::string& stem) {
   const std::uint64_t n = ++s_counter;
-  std::string key = "pg1-" + stem + "-" + std::to_string(n);
+  // PID-scoped: keys never collide ACROSS test processes/runs, so rows
+  // orphaned by a killed run (whose TearDown never executed) cannot pollute
+  // a later run's assertions. Leftovers remain inert and unique.
+  const std::string key =
+      "pg1-" + std::to_string(test_process_id()) + "-" + stem + "-" + std::to_string(n);
   owned_keys_.push_back(key);
   return key;
 }

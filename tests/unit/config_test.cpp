@@ -214,5 +214,55 @@ TEST(ConfigTest, InvalidCoordinationEnvironmentFallsBackWithWarnings) {
   EXPECT_TRUE(cfg.validate().empty());
 }
 
+TEST(ConfigTest, WaiterDefaultsAreValid) {
+  const Config cfg = Config::defaults();
+  EXPECT_EQ(cfg.waiter_timeout_ms, 30000u);
+  EXPECT_EQ(cfg.waiter_recheck_ms, 1000u);
+  EXPECT_EQ(cfg.max_waiters_per_key, 1024u);
+  EXPECT_TRUE(cfg.validate().empty()) << cfg.validate();
+}
+
+TEST(ConfigTest, WaiterBoundsAreEnforced) {
+  for (unsigned bad_timeout : {0u, 999u, 300001u}) {
+    Config cfg = Config::defaults();
+    cfg.waiter_timeout_ms = bad_timeout;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_timeout;
+  }
+  for (unsigned bad_recheck : {0u, 99u, 30001u}) {
+    Config cfg = Config::defaults();
+    cfg.waiter_recheck_ms = bad_recheck;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_recheck;
+  }
+  for (unsigned bad_cap : {0u, 100001u}) {
+    Config cfg = Config::defaults();
+    cfg.max_waiters_per_key = bad_cap;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_cap;
+  }
+}
+
+TEST(ConfigTest, WaiterEnvironmentOverridesAreHonored) {
+  test::EnvGuard timeout("APEX_WAITER_TIMEOUT_MS", "15000");
+  test::EnvGuard recheck("APEX_WAITER_RECHECK_MS", "250");
+  test::EnvGuard cap("APEX_MAX_WAITERS_PER_KEY", "64");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_TRUE(warnings.empty());
+  EXPECT_EQ(cfg.waiter_timeout_ms, 15000u);
+  EXPECT_EQ(cfg.waiter_recheck_ms, 250u);
+  EXPECT_EQ(cfg.max_waiters_per_key, 64u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
+TEST(ConfigTest, InvalidWaiterEnvironmentFallsBackWithWarnings) {
+  test::EnvGuard timeout("APEX_WAITER_TIMEOUT_MS", "forever");
+  test::EnvGuard cap("APEX_MAX_WAITERS_PER_KEY", "0");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_EQ(cfg.waiter_timeout_ms, 30000u);
+  EXPECT_EQ(cfg.max_waiters_per_key, 1024u);
+  EXPECT_EQ(warnings.size(), 2u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
 }  // namespace
 }  // namespace apex::config

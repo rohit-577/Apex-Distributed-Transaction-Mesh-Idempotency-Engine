@@ -10,13 +10,15 @@ namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
 HttpServer::HttpServer(asio::io_context& ioc, const config::Config& config, std::string version,
-                       std::shared_ptr<idempotency::IdempotencyService> service,
-                       asio::thread_pool* db_pool)
+                       std::string phase, std::shared_ptr<idempotency::IdempotencyService> service,
+                       asio::thread_pool* db_pool, observability::Logger& logger)
     : ioc_(ioc),
       config_(config),
       version_(std::move(version)),
+      phase_(std::move(phase)),
       service_(std::move(service)),
       db_pool_(db_pool),
+      logger_(logger),
       acceptor_(ioc) {}
 
 void HttpServer::start() {
@@ -51,7 +53,7 @@ void HttpServer::do_accept() {
       return;
     }
     if (!ec) {
-      Session::launch(std::move(socket), config_, version_, service_, db_pool_);
+      Session::launch(std::move(socket), config_, version_, phase_, service_, db_pool_, logger_);
     }
     // On transient accept errors the loop continues; on stop() running_ is
     // false and the chain ends here. The server object must outlive pending

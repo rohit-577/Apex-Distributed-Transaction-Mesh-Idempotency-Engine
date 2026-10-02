@@ -11,6 +11,7 @@ add_executable(apex_tests
   unit/router_test.cpp
   unit/idempotency_contract_test.cpp
   unit/lease_contract_test.cpp
+  unit/waiter_registry_test.cpp
   common/test_helpers.cpp
   common/pg_fixture.cpp
   integration/http_test.cpp
@@ -20,9 +21,13 @@ add_executable(apex_tests
   integration/lease_redis_test.cpp
   integration/fencing_test.cpp
   integration/cross_system_test.cpp
+  integration/waiter_lifecycle_test.cpp
+  integration/subscriber_spike_test.cpp
   concurrency/parallel_health_test.cpp
   concurrency/idempotency_race_test.cpp
   concurrency/lease_recovery_stress_test.cpp
+  concurrency/multiplexing_test.cpp
+  concurrency/cross_node_test.cpp
 )
 
 target_include_directories(apex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

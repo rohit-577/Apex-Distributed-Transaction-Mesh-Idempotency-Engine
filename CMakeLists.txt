@@ -1,6 +1,6 @@
 # Apex — Distributed Transaction Mesh & Idempotency Engine
-# Phase 2: Redis lease ownership + durable fencing epochs (no pub/sub, no
-# waiter multiplexing, no Redlock — those are later phases).
+# Phase 3: in-flight request multiplexing (owner executes once, duplicates
+# wait on durable completion; pub/sub is wake-up only).
 #
 # Configure (Visual Studio generator is the supported default on Windows):
 #   cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
@@ -19,7 +19,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(Apex
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "Distributed Transaction Mesh & Idempotency Engine"
   LANGUAGES CXX
 )
@@ -70,7 +70,8 @@ add_library(apex_core STATIC
   src/execution/HttpServer.cpp
   src/idempotency/IdempotencyKey.cpp
   src/idempotency/Fingerprint.cpp
-  src/idempotency/SimulatedOperation.cpp
+  src/idempotency/OperationExecutor.cpp
+  src/idempotency/WaiterRegistry.cpp
   src/idempotency/IdempotencyService.cpp
   src/persistence/PgConnection.cpp
   src/persistence/ConnectionPool.cpp
@@ -78,6 +79,7 @@ add_library(apex_core STATIC
   src/persistence/Schema.cpp
   src/coordination/RedisClient.cpp
   src/coordination/LeaseManager.cpp
+  src/coordination/CompletionSubscriber.cpp
 )
 
 target_include_directories(apex_core PUBLIC src)
@@ -127,7 +129,7 @@ if(APEX_WARNINGS_AS_ERRORS AND MSVC)
   target_compile_options(apex PRIVATE /WX)
 endif()
 
-target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase2")
+target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase3" APEX_PHASE="phase-3")
 
 # ---------------------------------------------------------------------------
 # Tests (separate target tree; see tests/CMakeLists.txt).

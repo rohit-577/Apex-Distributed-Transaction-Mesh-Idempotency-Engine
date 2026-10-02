@@ -6,16 +6,20 @@
 // Boost.Asio I/O thread (INV-01, same rule as PgConnection).
 //
 // Per AGENTS.md §2 this is the ONLY place that opens Redis connections:
-// LeaseManager and all tests go through here. Connection pooling is
-// redis-plus-plus's own (thread-safe `sw::redis::Redis` with a pool), sized
-// from configuration.
+// LeaseManager, the completion publisher/subscriber, and all tests go
+// through here. Connection pooling is redis-plus-plus's own (thread-safe
+// `sw::redis::Redis` with a pool), sized from configuration. The blocking
+// subscriber loop runs on ONE dedicated coordination thread (see
+// CompletionSubscriber), never per-waiter and never on I/O threads.
 //
 // Fail-closed behavior: any connection/command failure surfaces as
 // RedisError. Callers (LeaseManager, service) map it to controlled
 // unavailability — never to "proceed without coordination".
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -72,6 +76,24 @@ class RedisClient {
 
   // Best-effort raw delete for test cleanup (leases only, never data).
   void del(const std::string& key);
+
+  // PUBLISH channel message. Returns the number of receiving clients.
+  // Best-effort by contract (at-most-once fan-out): a return of 0 or a
+  // RedisError changes nothing about correctness — the durable commit
+  // already happened and waiters re-check PostgreSQL regardless.
+  [[nodiscard]] long long publish(const std::string& channel, const std::string& message);
+
+  // Blocking pattern-subscribe loop for ONE pattern. Registers `on_message`,
+  // subscribes, then consumes until `stop` is set. Returns normally on stop;
+  // throws RedisError on connection loss or subscribe failure (the caller —
+  // CompletionSubscriber — backs off, resubscribes, and sweeps waiters to
+  // re-check durable state, which is what makes missed-notification windows
+  // safe). Runs on the caller's thread: dedicated coordination thread only.
+  using PatternMessageHandler =
+      std::function<void(const std::string& pattern, const std::string& channel,
+                         const std::string& message)>;
+  void psubscribe_loop(const std::string& pattern, PatternMessageHandler on_message,
+                       const std::atomic<bool>& stop);
 
  private:
   std::unique_ptr<sw::redis::Redis> redis_;

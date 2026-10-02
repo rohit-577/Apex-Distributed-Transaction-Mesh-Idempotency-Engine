@@ -1,7 +1,7 @@
 {
   "name": "apex",
-  "version": "0.3.0",
-  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 2: lease ownership + fencing)",
+  "version": "0.4.0",
+  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 3: in-flight multiplexing)",
   "dependencies": [
     "boost-asio",
     "boost-beast",

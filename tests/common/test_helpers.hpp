@@ -28,6 +28,7 @@
 
 #include "config/Config.hpp"
 #include "execution/HttpServer.hpp"
+#include "observability/Logger.hpp"
 
 namespace apex::persistence {
 class ConnectionPool;
@@ -54,6 +55,9 @@ class EnvGuard {
 };
 
 [[nodiscard]] std::uint16_t acquire_closed_port();
+
+// Process ID for test-key namespacing (see PgFixture::unique_key).
+[[nodiscard]] unsigned long test_process_id();
 
 // Minimal blocking HTTP client for tests. Opens a fresh connection per call,
 // sends one request, reads one response. Not performance-sensitive by
@@ -112,6 +116,9 @@ class TestServer {
   // Declared before server_: destroyed after it (reverse order), so no
   // Session outlives the pool it posts to.
   std::unique_ptr<boost::asio::thread_pool> db_pool_;
+  // Session waiter-event log. Warning level keeps passing suites quiet while
+  // preserving timeout/shutdown visibility.
+  observability::Logger logger_{observability::Level::Warning};
   execution::HttpServer server_;
   std::thread thread_;
 };

@@ -15,7 +15,8 @@ std::string_view path_only(std::string_view target) {
 
 }  // namespace
 
-Router::Router(std::string version) : version_(std::move(version)) {}
+Router::Router(std::string version, std::string phase)
+    : version_(std::move(version)), phase_(std::move(phase)) {}
 
 RouteResult Router::route(http::verb method, std::string_view target) const {
   const std::string_view path = path_only(target);
@@ -23,7 +24,7 @@ RouteResult Router::route(http::verb method, std::string_view target) const {
   if (path == "/health") {
     if (method == http::verb::get) {
       const nlohmann::json body = {
-          {"status", "ok"}, {"service", "apex"}, {"version", version_}, {"phase", "phase-1"}};
+          {"status", "ok"}, {"service", "apex"}, {"version", version_}, {"phase", phase_}};
       return {200, body.dump(), ""};
     }
     return {405, R"({"error":"method_not_allowed"})", "GET"};

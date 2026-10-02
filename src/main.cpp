@@ -25,10 +25,13 @@
 #include <boost/asio/thread_pool.hpp>
 
 #include "config/Config.hpp"
+#include "coordination/CompletionSubscriber.hpp"
 #include "coordination/LeaseManager.hpp"
 #include "coordination/RedisClient.hpp"
 #include "execution/HttpServer.hpp"
 #include "idempotency/IdempotencyService.hpp"
+#include "idempotency/OperationExecutor.hpp"
+#include "idempotency/WaiterRegistry.hpp"
 #include "observability/Logger.hpp"
 #include "persistence/ConnectionPool.hpp"
 #include "persistence/PgConnection.hpp"
@@ -78,7 +81,17 @@ int run() {
   auto leases = std::make_shared<apex::coordination::LeaseManager>(
       redis, std::chrono::milliseconds(config.lease_ttl_ms), logger);
 
-  auto service = std::make_shared<apex::idempotency::IdempotencyService>(pool, logger, leases);
+  auto service_deps = apex::idempotency::ServiceDependencies{};
+  service_deps.pool = pool;
+  service_deps.leases = leases;
+  service_deps.executor = std::make_shared<apex::idempotency::SimulatedExecutor>();
+  service_deps.registry = std::make_shared<apex::idempotency::WaiterRegistry>(
+      apex::idempotency::WaiterOptions{
+          static_cast<long long>(config.waiter_timeout_ms),
+          static_cast<long long>(config.waiter_recheck_ms), config.max_waiters_per_key});
+  service_deps.redis = redis;
+  auto service =
+      std::make_shared<apex::idempotency::IdempotencyService>(std::move(service_deps), logger);
   boost::asio::thread_pool db_pool(config.db_pool_size);
 
   // Best-effort schema ensure on the MAIN thread (blocking is fine here —
@@ -94,7 +107,13 @@ int run() {
     logger.warning(std::string("schema ensure skipped (database unreachable?): ") + e.what());
   }
 
-  HttpServer server(ioc, config, APEX_VERSION, service, &db_pool);
+  // Cross-node waiter wake-ups (best-effort pub/sub; correctness never
+  // depends on it). Started after the schema ensure so its thread never
+  // outlives the registry it dispatches to (stopped explicitly below).
+  apex::coordination::CompletionSubscriber subscriber(redis, *service->registry(), logger);
+  subscriber.start();
+
+  HttpServer server(ioc, config, APEX_VERSION, APEX_PHASE, service, &db_pool, logger);
   server.start();
 
   logger.info("apex " + std::string(APEX_VERSION) + " listening on 0.0.0.0:" +
@@ -108,6 +127,11 @@ int run() {
   signals.async_wait([&](const boost::system::error_code&, int /*signal*/) {
     logger.info("shutdown signal received; draining connections");
     server.stop();
+    // Wake waiters with 202 while the loop still runs (their deferred
+    // responses need a live io_context), then stop the subscriber thread
+    // before anything it touches can die.
+    service->registry()->shutdown();
+    subscriber.stop();
     ioc.stop();
   });
 

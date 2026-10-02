@@ -4,15 +4,26 @@
 // itself when the connection ends or an unrecoverable error occurs.
 //
 // Rules enforced here:
-// - No blocking work: request handling is either a pure Router call or an
-//   asynchronous DependencyChecker probe.
+// - No blocking work: request handling is either a pure Router call, an
+//   asynchronous DependencyChecker probe, or a worker-pool service call
+//   whose completion posts back. Waiting suspends WITHOUT holding any
+//   thread: the session persists as timer + registry registration only.
 // - Bounded state: the request body parser rejects payloads over 1 MiB with
 //   a controlled 413 instead of growing memory without limit.
 // - Controlled errors: unparsable bytes get a 400 response (then the
-//   connection closes, because the stream position is no longer reliable);
+//   connection closes, because the stream position is unreliable);
 //   every other failure mode maps to a JSON status, never to a dropped
 //   connection or an exception escaping into the I/O loop.
+//
+// Multiplexing (Phase 3): when the service verdict is Wait, the session
+// registers in the shared WaiterRegistry and arms ONE Asio timer (the
+// sooner of recheck-interval / remaining-deadline). Wake-up (local notify,
+// Redis pub/sub, timer) always funnels into a durable re-read via
+// service->handle() — the notification never decides, PostgreSQL does
+// (INV-MUX-03/04). Timeout answers 202 without touching durable state
+// (INV-MUX-06). All wait continuations run on the session strand.
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -20,15 +31,17 @@
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 
 #include "api/Router.hpp"
 #include "config/Config.hpp"
+#include "idempotency/IdempotencyService.hpp"
 
-namespace apex::idempotency {
-class IdempotencyService;
-}  // namespace apex::idempotency
+namespace apex::observability {
+class Logger;
+}  // namespace apex::observability
 
 namespace boost::asio {
 class thread_pool;
@@ -40,31 +53,59 @@ class Session : public std::enable_shared_from_this<Session> {
  public:
   static constexpr std::size_t kMaxBodyBytes = 1024 * 1024;  // 1 MiB
 
-  // Takes ownership of a connected socket. `version` is reported in JSON
-  // bodies; it comes from the APEX_VERSION compile definition.
+  // Takes ownership of a connected socket. `version`/`phase` are reported
+  // in JSON bodies; they come from the APEX_VERSION/APEX_PHASE compile
+  // definitions.
   // `service`/`db_pool` wire the durable idempotency layer: both null means
   // storage is not configured and POST /v1/operations answers 503. When a
   // service is present, db_pool must outlive every session (owned by main()
-  // or the test fixture, joined before destruction).
+  // or the test fixture, joined before destruction). `logger` emits the
+  // waiter lifecycle events (§26); it must outlive every session.
   static void launch(boost::asio::ip::tcp::socket socket, const config::Config& config,
-                     std::string version,
+                     std::string version, std::string phase,
                      std::shared_ptr<idempotency::IdempotencyService> service,
-                     boost::asio::thread_pool* db_pool);
+                     boost::asio::thread_pool* db_pool, observability::Logger& logger);
 
  private:
   Session(boost::asio::ip::tcp::socket socket, const config::Config& config,
-          std::string version, std::shared_ptr<idempotency::IdempotencyService> service,
-          boost::asio::thread_pool* db_pool);
+          std::string version, std::string phase,
+          std::shared_ptr<idempotency::IdempotencyService> service,
+          boost::asio::thread_pool* db_pool, observability::Logger& logger);
 
   void do_read();
   void on_read(boost::beast::error_code ec);
   void handle_request();
   void handle_ready(boost::beast::http::verb method, unsigned version, bool keep_alive);
   void handle_operations(unsigned version, bool keep_alive);
+  // Phase 3 waiter suspend/resume. All run on the session strand; the pool
+  // is only used for service->handle() re-reads.
+  void enter_wait(idempotency::OperationRequest request, unsigned version, bool keep_alive);
+  void continue_wait();
+  void recheck_now();
+  void on_recheck_result(const idempotency::OperationOutcome& outcome);
+  void on_wait_timer(boost::beast::error_code ec);
+  void on_wait_wake();
+  void settle_wait(int status, const std::string& body);
+  void settle_wait_timeout();
+  void abort_wait();
+  [[nodiscard]] static std::string waiter_timeout_body(bool shutting_down);
+  void logger_wait_event(const char* event);
   void send_json(int status, const std::string& body, unsigned version, bool keep_alive,
                  const std::string& allow = "");
   void do_write();
   void do_close();
+
+  // Deferred waiter response state. Present only while a response is
+  // pending on another generation's completion.
+  struct PendingWait {
+    idempotency::OperationRequest request;
+    std::string channel;
+    std::uint64_t waiter_id{0};
+    unsigned http_version{11};
+    bool keep_alive{false};
+    std::chrono::steady_clock::time_point deadline{};
+    bool settled{false};
+  };
 
   boost::beast::tcp_stream stream_;
   boost::beast::flat_buffer buffer_;
@@ -75,6 +116,9 @@ class Session : public std::enable_shared_from_this<Session> {
   api::Router router_;
   std::shared_ptr<idempotency::IdempotencyService> service_;
   boost::asio::thread_pool* db_pool_;
+  observability::Logger& logger_;
+  boost::asio::steady_timer wait_timer_;
+  std::optional<PendingWait> pending_wait_;
 };
 
 }  // namespace apex::execution

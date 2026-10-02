@@ -93,6 +93,50 @@ Every invariant is numbered so tests and code can reference it (e.g.
   stands. The check is never application-only. *Validated by F4–F7, F9,
   and the deterministic T1–T7 stale-owner race.*
 
+## Phase 3 — Enforced (in-flight multiplexing)
+
+- **INV-MUX-01 — Concurrent duplicates do not independently execute.**
+  Same key + fingerprint converges on one logical execution; the rest wait
+  or replay. *Validated by P3-01/02/03 with an execution counter (2/50/100
+  → exactly 1) and P3-16/17 (8 keys → 8, mixed fingerprints → 1).*
+- **INV-MUX-02 — One valid owner generation per terminal result.** Phase 2
+  fencing decides whose commit counts; multiplexing never creates a second
+  writer. *Validated by P3-11 (abandoned owner fenced, waiter recovers) and
+  the unchanged T1–T7 race.*
+- **INV-MUX-03 — PostgreSQL terminal state is the source of truth.** Every
+  waiter verdict comes from a durable re-read, including the mandatory
+  immediate re-check after registration. *Validated by P3-07 (both
+  subscription orders) and every convergence test comparing stored bytes.*
+- **INV-MUX-04 — Pub/Sub is never proof of completion.** A notification only
+  wakes; the waiter answers from the row. *Validated by P3-08 (commit with
+  zero broadcast converges) and P3-09 (Redis down: replay works).*
+- **INV-MUX-05 — Missed notifications cannot corrupt correctness.** Fallback
+  Asio-timer re-checks bound every wait; subscriber reconnects sweep all
+  waiters. *Validated by P3-08/15 (subscriber deaf or absent) and the
+  reconnect-sweep path.*
+- **INV-MUX-06 — Waiter timeout mutates nothing durable.** Timeout answers
+  202; row, lease, epoch, and owner are untouched. *Validated by P3-13
+  (row still PROCESSING/epoch 1, lease held, owner completes after).*
+- **INV-MUX-07 — Stale owners cannot overwrite.** Unchanged Phase 2
+  guarantee; waiter logic never bypasses the epoch predicate. *Validated by
+  P3-11/12 and the owner-vs-recovery stress race.*
+- **INV-MUX-08 — All waiters return the stored result.** Byte-identical
+  convergence on the durable response (status, body, content type).
+  *Validated by every P3 convergence assertion comparing waiter bytes.*
+- **INV-MUX-09 — Conflicts never execute.** Same key + different fingerprint
+  answers 409 with zero executions of the conflicting body. *Validated by
+  P3-06/17 with execution counts.*
+- **INV-MUX-10 — Replay works with Redis unavailable.** Terminal paths never
+  touch Redis. *Validated by P3-09/10 (dead-Redis replay 200, zero new
+  executions).*
+- **INV-MUX-11 — Waiter coordination is reconstructible.** Registry loss
+  (restart) only costs wake-ups; correctness rebuilds from PostgreSQL.
+  *Validated by P3-18 (teardown clean, fresh server serves) and the
+  restart run in verification.*
+- **INV-MUX-12 — Waiting is safe even if completion precedes registration.**
+  Register-then-always-recheck closes the CHECK→REGISTER race by protocol,
+  not by registry memory. *Validated by the registry unit test plus P3-07.*
+
 ## Non-invariants (explicitly NOT promised)
 
 - Request ordering across different keys; any latency bound on Phase 0

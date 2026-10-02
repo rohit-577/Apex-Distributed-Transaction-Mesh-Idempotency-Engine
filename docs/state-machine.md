@@ -1,7 +1,21 @@
 # Apex Idempotency Record State Machine
 
-Status: **Implemented (Phase 2): durable core + lease ownership + fencing
-epochs. Waiter multiplexing is the next phase and is marked as such.**
+Status: **Implemented (Phase 3): durable core + lease ownership + fencing
+epochs + in-flight multiplexing. Request roles below are runtime roles,
+not durable states — the table still has exactly three states.**
+
+## Durable states vs request roles
+
+Durable (PostgreSQL): `PROCESSING`, `COMPLETED`, `FAILED` — unchanged.
+No `WAITING` state exists and none is needed: waiting observes state, it
+is not state.
+
+Runtime roles per request: `OWNER` (holds a valid lease + current epoch and
+executes), `WAITER` (same key+fingerprint, another generation owns — suspends
+without executing, writing, or fencing), `REPLAYER` (terminal row observed),
+`CONFLICT` (fingerprint mismatch). A waiter that observes a dead owner
+promotes to owner through the standard Phase 2 recovery CAS — waiting and
+recovery are different operations sharing one decision engine.
 
 ## Record lifecycle (one row per idempotency key, durable in PostgreSQL)
 
@@ -81,19 +95,25 @@ lease key present? --yes--> 202 (active owner; non-waiting)
 | Redis down during ownership attempt | No row created | Unreachable | 503 `redis_unavailable`, fail closed, no orphan. |
 | PostgreSQL down during ownership persist | Nothing committed (aborted txn) | Lease released on exit | 503 `storage_unavailable`; epoch untouched; fresh connection recovers. |
 | Crash mid-`UPDATE` | Impossible to observe half-written (single statement) | — | — |
+| Owner crashes before durable completion | `PROCESSING` | lease may remain/expire | Waiters suspend; recovery via Phase 2 takes ownership; waiters converge. |
+| PG commit succeeds, publish fails | Terminal | no notification | Correctness intact: waiters converge via fallback re-check. |
+| Publish succeeds, waiter misses it | Terminal | notification sent | Fallback re-check finds the row; reconnect sweep prods deaf waiters. |
+| Waiter starts after completion | Terminal | Irrelevant | Immediate replay, never registers. |
+| Redis unavailable, terminal exists | Terminal | Unreachable | Replay works (INV-MUX-10). |
+| Redis unavailable during `PROCESSING` | `PROCESSING` | Unreachable | 503 fail-closed (documented fallback semantics). |
+| Stale owner resumes | Terminal/newer epoch | Old lease invalid | Fenced write rejected (INV-MUX-07). |
+| Waiter exceeds deadline | `PROCESSING` (unchanged) | Any | Waiter exits 202; durable state, lease, epoch untouched (INV-MUX-06). |
+| Process shutdown with waiters | Any | Subscriber closes | Registry shutdown wakes all (202); timers abort; clean exit (P3-18). |
+| Process restart | Committed rows survive | Subscriptions re-established | Waiter state rebuilds from PostgreSQL (INV-MUX-11). |
 
-## Crash windows (honest, not solved)
+## Residual honest limits
 
-- **Crash between acquire-commit and terminal write:** a `PROCESSING` row is
-  orphaned. It answers `202` to duplicates until the later lease-recovery
-  phase reaps or adopts it. Operators can spot these rows (`completed_at IS
-  NULL`, old `created_at`). Distributed lease recovery is explicitly out of
-  scope for Phase 1.
-- **Crash mid-`UPDATE`:** impossible to observe half-written — single
-  statement, single row.
-- **Process death with in-flight HTTP sessions:** in-memory waiters die;
-  committed rows survive; clients retry with the same key and converge on
-  the terminal response.
+- An orphaned `PROCESSING` row still waits for the next same-key request
+  (or operator action) — no background healing. It is *visible*
+  (`completed_at IS NULL`) and *honest* (duplicates wait or recover, never
+  see a fabricated result).
+- A waiter can only converge as fast as its wake-ups: pub/sub normally,
+  fallback interval at worst, deadline at latest.
 
 ## Out of scope
 

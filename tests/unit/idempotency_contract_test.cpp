@@ -9,7 +9,7 @@
 
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/IdempotencyKey.hpp"
-#include "idempotency/SimulatedOperation.hpp"
+#include "idempotency/OperationExecutor.hpp"
 #include "persistence/IdempotencyRepository.hpp"
 #include "persistence/PgConnection.hpp"
 
@@ -99,7 +99,8 @@ TEST(FingerprintTest, ScalarBodiesAreFingerprintedToo) {
 }
 
 TEST(SimulatedOperationTest, SuccessEchoesTheCanonicalRequest) {
-  const SimulatedResult result = run_simulated(R"({"a":1})");
+  SimulatedExecutor executor;
+  const ExecutionResult result = executor.execute(R"({"a":1})");
   EXPECT_TRUE(result.success);
   EXPECT_EQ(result.http_status, 200);
   EXPECT_EQ(result.content_type, "application/json");
@@ -109,8 +110,9 @@ TEST(SimulatedOperationTest, SuccessEchoesTheCanonicalRequest) {
 }
 
 TEST(SimulatedOperationTest, FailFlagFailsDeterministically) {
-  const SimulatedResult first = run_simulated(R"({"fail":true})");
-  const SimulatedResult second = run_simulated(R"({"fail" : true, "x" : 1})");
+  SimulatedExecutor executor;
+  const ExecutionResult first = executor.execute(R"({"fail":true})");
+  const ExecutionResult second = executor.execute(R"({"fail" : true, "x" : 1})");
   EXPECT_FALSE(first.success);
   EXPECT_EQ(first.http_status, 500);
   EXPECT_EQ(first.error_code, "simulated_failure");
@@ -118,9 +120,10 @@ TEST(SimulatedOperationTest, FailFlagFailsDeterministically) {
 }
 
 TEST(SimulatedOperationTest, FailFlagMustBeBooleanTrue) {
-  EXPECT_TRUE(run_simulated(R"({"fail":false})").success);
-  EXPECT_TRUE(run_simulated(R"({"fail":"true"})").success);
-  EXPECT_TRUE(run_simulated(R"([{"fail":true}])").success);
+  SimulatedExecutor executor;
+  EXPECT_TRUE(executor.execute(R"({"fail":false})").success);
+  EXPECT_TRUE(executor.execute(R"({"fail":"true"})").success);
+  EXPECT_TRUE(executor.execute(R"([{"fail":true}])").success);
 }
 
 TEST(RecordStatusTest, RoundTripsAllStatesAndRejectsGarbage) {
