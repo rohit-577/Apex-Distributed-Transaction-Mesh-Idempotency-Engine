@@ -129,8 +129,12 @@ TEST(RecordStatusTest, RoundTripsAllStatesAndRejectsGarbage) {
   EXPECT_EQ(apex::persistence::status_from_string("COMPLETED"), RecordStatus::Completed);
   EXPECT_EQ(apex::persistence::status_from_string("FAILED"), RecordStatus::Failed);
   EXPECT_STREQ(apex::persistence::to_string(RecordStatus::Processing), "PROCESSING");
-  EXPECT_THROW(apex::persistence::status_from_string("PENDING"), apex::persistence::PgError);
-  EXPECT_THROW(apex::persistence::status_from_string(""), apex::persistence::PgError);
+  // EXPECT_THROW cannot take the nodiscard call directly (macro argument
+  // splitting), so the throwing statements are wrapped in void lambdas.
+  const auto parse_pending = [] { (void)apex::persistence::status_from_string("PENDING"); };
+  const auto parse_empty = [] { (void)apex::persistence::status_from_string(""); };
+  EXPECT_THROW(parse_pending(), apex::persistence::PgError);
+  EXPECT_THROW(parse_empty(), apex::persistence::PgError);
 }
 
 }  // namespace

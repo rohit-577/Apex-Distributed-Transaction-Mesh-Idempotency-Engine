@@ -39,10 +39,22 @@ constexpr const char* kDbPoolEnv = "APEX_DB_POOL_SIZE";
 constexpr const char* kMigrationsEnv = "APEX_MIGRATIONS_DIR";
 constexpr const char* kRedisHostEnv = "APEX_REDIS_HOST";
 constexpr const char* kRedisPortEnv = "APEX_REDIS_PORT";
+constexpr const char* kRedisPasswordEnv = "APEX_REDIS_PASSWORD";
+constexpr const char* kRedisPoolEnv = "APEX_REDIS_POOL_SIZE";
+constexpr const char* kLeaseTtlEnv = "APEX_LEASE_TTL_MS";
+constexpr const char* kRedisTimeoutEnv = "APEX_REDIS_OP_TIMEOUT_MS";
 constexpr const char* kLogLevelEnv = "APEX_LOG_LEVEL";
 
 constexpr unsigned kMaxThreads = 256;
 constexpr unsigned kMaxDbPool = 64;
+constexpr unsigned kMaxRedisPool = 64;
+// Lease window bounds (ms). Floor: below 1 s, expiry races the operation it
+// is meant to protect. Ceiling: beyond 5 min the lease is effectively
+// immortal and orphan recovery stops working.
+constexpr unsigned kMinLeaseTtlMs = 1000;
+constexpr unsigned kMaxLeaseTtlMs = 300000;
+constexpr unsigned kMinRedisTimeoutMs = 100;
+constexpr unsigned kMaxRedisTimeoutMs = 60000;
 
 bool parse_port(const char* text, std::uint16_t& out) {
   if (text == nullptr || *text == '\0') {
@@ -64,6 +76,20 @@ bool parse_bounded_count(const char* text, unsigned& out, unsigned max) {
   char* end = nullptr;
   const long value = std::strtol(text, &end, 10);
   if (end == text || *end != '\0' || value < 1 || value > static_cast<long>(max)) {
+    return false;
+  }
+  out = static_cast<unsigned>(value);
+  return true;
+}
+
+bool parse_ranged_ms(const char* text, unsigned& out, unsigned min_ms, unsigned max_ms) {
+  if (text == nullptr || *text == '\0') {
+    return false;
+  }
+  char* end = nullptr;
+  const long value = std::strtol(text, &end, 10);
+  if (end == text || *end != '\0' || value < static_cast<long>(min_ms) ||
+      value > static_cast<long>(max_ms)) {
     return false;
   }
   out = static_cast<unsigned>(value);
@@ -150,6 +176,33 @@ std::pair<Config, std::vector<std::string>> Config::load_from_environment() {
       cfg.redis_port = 6379;
     }
   }
+  // Same no-echo policy as the PostgreSQL password: secrets never appear in
+  // warnings or logs.
+  if (const auto v = get_env(kRedisPasswordEnv); v) {
+    cfg.redis_password = *v;
+  }
+  if (const auto v = get_env(kRedisPoolEnv); v && !v->empty()) {
+    if (!parse_bounded_count(v->c_str(), cfg.redis_pool_size, kMaxRedisPool)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kRedisPoolEnv +
+                            "; using default 8.");
+      cfg.redis_pool_size = 8;
+    }
+  }
+  if (const auto v = get_env(kLeaseTtlEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.lease_ttl_ms, kMinLeaseTtlMs, kMaxLeaseTtlMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kLeaseTtlEnv +
+                            "; using default 10000.");
+      cfg.lease_ttl_ms = 10000;
+    }
+  }
+  if (const auto v = get_env(kRedisTimeoutEnv); v && !v->empty()) {
+    if (!parse_ranged_ms(v->c_str(), cfg.redis_op_timeout_ms, kMinRedisTimeoutMs,
+                         kMaxRedisTimeoutMs)) {
+      warnings.emplace_back(std::string("Ignoring invalid ") + kRedisTimeoutEnv +
+                            "; using default 2000.");
+      cfg.redis_op_timeout_ms = 2000;
+    }
+  }
   if (const auto v = get_env(kLogLevelEnv); v && !v->empty()) {
     cfg.log_level = *v;
   }
@@ -181,6 +234,15 @@ std::string Config::validate() const {
   }
   if (redis_host.empty()) {
     return "redis_host must not be empty";
+  }
+  if (redis_pool_size < 1 || redis_pool_size > kMaxRedisPool) {
+    return "redis_pool_size must be in [1, 64]";
+  }
+  if (lease_ttl_ms < kMinLeaseTtlMs || lease_ttl_ms > kMaxLeaseTtlMs) {
+    return "lease_ttl_ms must be in [1000, 300000]";
+  }
+  if (redis_op_timeout_ms < kMinRedisTimeoutMs || redis_op_timeout_ms > kMaxRedisTimeoutMs) {
+    return "redis_op_timeout_ms must be in [100, 60000]";
   }
   if (log_level != "debug" && log_level != "info" && log_level != "warning" &&
       log_level != "error") {

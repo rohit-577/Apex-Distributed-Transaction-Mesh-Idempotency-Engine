@@ -158,11 +158,15 @@ TEST_F(PgFixture, SameKeyDifferentFingerprintsConflictCleanly) {
     t.join();
   }
 
-  // Exactly one side inserted (200 after executing); the other found the
-  // row with a different fingerprint (409). A 202 is impossible here: it
-  // requires same-fingerprint + PROCESSING, and the fingerprints differ.
-  EXPECT_TRUE((statuses[0] == 200 && statuses[1] == 409) ||
-              (statuses[0] == 409 && statuses[1] == 200))
+  // Ownership decides, then durability decides. Exactly one side wins the
+  // lease and executes (200). The other side EITHER arrives after the row
+  // commits (sees the fingerprint mismatch => 409) OR arrives before the
+  // row exists and loses the lease race (cannot know the fingerprints yet
+  // => honest 202 "retry later"; its retry then converges to 200/409).
+  // A 202 here is NOT a missed conflict: the conflict verdict requires the
+  // durable row, which did not exist yet for that contender.
+  EXPECT_TRUE((statuses[0] == 200 && (statuses[1] == 409 || statuses[1] == 202)) ||
+              (statuses[1] == 200 && (statuses[0] == 409 || statuses[0] == 202)))
       << statuses[0] << " vs " << statuses[1];
   const bool first_won = (statuses[0] == 200);
 

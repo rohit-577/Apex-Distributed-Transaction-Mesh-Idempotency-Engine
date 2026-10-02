@@ -13,6 +13,7 @@
 // 1 runtime failure, 2 invalid configuration.
 
 #include <csignal>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -24,6 +25,8 @@
 #include <boost/asio/thread_pool.hpp>
 
 #include "config/Config.hpp"
+#include "coordination/LeaseManager.hpp"
+#include "coordination/RedisClient.hpp"
 #include "execution/HttpServer.hpp"
 #include "idempotency/IdempotencyService.hpp"
 #include "observability/Logger.hpp"
@@ -58,7 +61,24 @@ int run() {
   // /health and /ready keep their Phase 0 behavior regardless.
   auto pool = std::make_shared<apex::persistence::ConnectionPool>(config.postgres_conninfo(),
                                                                   config.db_pool_size);
-  auto service = std::make_shared<apex::idempotency::IdempotencyService>(pool, logger);
+
+  // Lease coordination (single Redis instance — NOT Redlock, documented in
+  // docs/lease-and-fencing.md). redis-plus-plus connects lazily, so this
+  // never touches the network either: a dead Redis degrades to per-request
+  // 503s on ownership paths, while COMPLETED replays keep working.
+  apex::coordination::RedisEndpoint redis_endpoint;
+  redis_endpoint.host = config.redis_host;
+  redis_endpoint.port = config.redis_port;
+  redis_endpoint.password = config.redis_password;
+  redis_endpoint.connect_timeout = std::chrono::milliseconds(config.redis_op_timeout_ms);
+  redis_endpoint.command_timeout = std::chrono::milliseconds(config.redis_op_timeout_ms);
+  redis_endpoint.pool_size = config.redis_pool_size;
+  auto redis =
+      std::make_shared<apex::coordination::RedisClient>(std::move(redis_endpoint));
+  auto leases = std::make_shared<apex::coordination::LeaseManager>(
+      redis, std::chrono::milliseconds(config.lease_ttl_ms), logger);
+
+  auto service = std::make_shared<apex::idempotency::IdempotencyService>(pool, logger, leases);
   boost::asio::thread_pool db_pool(config.db_pool_size);
 
   // Best-effort schema ensure on the MAIN thread (blocking is fine here —
@@ -67,8 +87,7 @@ int run() {
   // Migrations are idempotent; the single source of truth is migrations/.
   try {
     apex::persistence::PgConnection bootstrap(config.postgres_conninfo());
-    apex::persistence::Schema::apply(
-        bootstrap, apex::persistence::Schema::read_migration_file(config.migrations_dir));
+    apex::persistence::Schema::ensure(bootstrap, config.migrations_dir);
     logger.info("idempotency schema ensured (" +
                 std::string(apex::persistence::Schema::kMigrationFile) + ")");
   } catch (const std::exception& e) {

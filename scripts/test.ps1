@@ -28,30 +28,33 @@ if (-not (Get-Command ctest -ErrorAction SilentlyContinue)) {
 
 if ($WithPostgres) {
   Set-Location $Root
-  Write-Host "Starting PostgreSQL via docker compose..."
-  & docker compose up -d postgres
+  Write-Host "Starting PostgreSQL + Redis via docker compose..."
+  & docker compose up -d postgres redis
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   $deadline = (Get-Date).AddSeconds(120)
   for (;;) {
-    $status = docker inspect --format "{{.State.Health.Status}}" "apex-phase0-postgres-1" 2>$null
-    if ($status -eq "healthy") { break }
+    $pg = docker inspect --format "{{.State.Health.Status}}" "apex-phase0-postgres-1" 2>$null
+    $re = docker inspect --format "{{.State.Health.Status}}" "apex-phase0-redis-1" 2>$null
+    if ($pg -eq "healthy" -and $re -eq "healthy") { break }
     if ((Get-Date) -ge $deadline) {
-      Write-Error "postgres did not become healthy within 120 seconds."
+      Write-Error "postgres ($pg) / redis ($re) did not become healthy within 120 seconds."
     }
     Start-Sleep -Seconds 2
   }
-  Write-Host "postgres is healthy."
+  Write-Host "postgres + redis are healthy."
 
   # Dev-stack credentials (docker-compose.yml defaults). These are
   # development-only values, already public in the repo — never use them
   # beyond local testing.
   $env:APEX_TEST_POSTGRES_CONN = "host=127.0.0.1 port=5432 dbname=apex user=apex " +
     "password=apex-dev-only connect_timeout=5 application_name=apex-tests"
-  Write-Host "APEX_TEST_POSTGRES_CONN set for gated tests."
+  $env:APEX_TEST_REDIS_HOST = "127.0.0.1"
+  $env:APEX_TEST_REDIS_PORT = "6379"
+  Write-Host "APEX_TEST_POSTGRES_CONN + APEX_TEST_REDIS_HOST set for gated tests."
 } else {
-  Write-Host ("PostgreSQL-gated tests will SKIP (no APEX_TEST_POSTGRES_CONN). " +
-    "Use -WithPostgres for the full suite.")
+  Write-Host ("Infrastructure-gated tests will SKIP (no APEX_TEST_POSTGRES_CONN / " +
+    "APEX_TEST_REDIS_HOST). Use -WithPostgres for the full suite.")
 }
 
 & ctest --test-dir (Join-Path $Root "build") -C $Config --output-on-failure

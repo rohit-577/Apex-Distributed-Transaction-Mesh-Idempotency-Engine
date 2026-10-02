@@ -1,7 +1,8 @@
-// POST /v1/operations end-to-end against real PostgreSQL (gated). Covers
-// the documented HTTP semantics: missing/invalid key, first request,
-// PROCESSING duplicate, COMPLETED replay, fingerprint conflict, FAILED
-// terminal, and storage-unavailable.
+// POST /v1/operations end-to-end against real PostgreSQL + real Redis
+// (gated). Covers the documented HTTP semantics: missing/invalid key, first
+// request, active-owner PROCESSING duplicate (202), orphan recovery to a new
+// epoch (200), COMPLETED replay, fingerprint conflict, FAILED terminal,
+// storage/coordination-unavailable, and fail-closed behavior without leases.
 
 #include <string>
 
@@ -12,6 +13,7 @@
 #include "common/pg_fixture.hpp"
 #include "common/test_helpers.hpp"
 #include "config/Config.hpp"
+#include "coordination/LeaseManager.hpp"
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/IdempotencyService.hpp"
 #include "observability/Logger.hpp"
@@ -140,21 +142,83 @@ TEST_F(PgFixture, CompletedDuplicateReplaysStoredResult) {
 }
 
 TEST_F(PgFixture, DuplicateWhileProcessingGets202) {
-  // A PROCESSING row planted directly (no complete call) is what a duplicate
-  // observes while the first execution is still running. Phase 1 answers
-  // 202 deliberately instead of blocking; multiplexing comes later.
+  // CASE B: a PROCESSING row whose owner still holds the Redis lease is an
+  // ACTIVE operation. The duplicate gets 202 without waiting (multiplexing
+  // is a later phase) and, crucially, no recovery is attempted: the epoch
+  // stays 1 and nothing executes.
   REQUIRE_PG();
+  REQUIRE_REDIS();
   const std::string key = unique_key("processing");
   {
     auto db = raw_connect();
     const persistence::AcquireResult acquired =
         repo().try_acquire(*db, key, fingerprint_of(R"({"p":1})"));
     ASSERT_EQ(acquired.outcome, persistence::AcquireOutcome::Created);
+    ASSERT_EQ(acquired.record.fencing_epoch, 1);
   }
+  // Simulate the still-active owner by holding its lease out-of-band.
+  const coordination::LeaseAttempt owner = leases().try_acquire(key);
+  ASSERT_EQ(owner.result, coordination::LeaseAttempt::Result::Acquired);
+
   test::TestServer server(ops_config(), service());
   const test::HttpResult result = post_ops(server.port(), key, R"({"p":1})");
   EXPECT_EQ(result.status, 202);
   EXPECT_NE(result.body.find("processing"), std::string::npos);
+
+  auto db = raw_connect();
+  const auto record = repo().find_by_key(*db, key);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->fencing_epoch, 1) << "active owner must not be recovered";
+  EXPECT_EQ(record->status, persistence::RecordStatus::Processing);
+}
+
+TEST_F(PgFixture, OrphanedProcessingRecoversToANewEpoch) {
+  // CASE C over HTTP: PROCESSING row, no lease held (owner gone). The
+  // duplicate becomes the recovery owner: epoch 1 -> 2, executes, 200.
+  // The replay afterwards is byte-identical.
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  const std::string key = unique_key("orphan");
+  {
+    auto db = raw_connect();
+    const persistence::AcquireResult acquired =
+        repo().try_acquire(*db, key, fingerprint_of(R"({"o":1})"));
+    ASSERT_EQ(acquired.outcome, persistence::AcquireOutcome::Created);
+  }
+  ASSERT_FALSE(leases().is_held(key)) << "no owner may hold this lease";
+
+  test::TestServer server(ops_config(), service());
+  const test::HttpResult result = post_ops(server.port(), key, R"({"o":1})");
+  EXPECT_EQ(result.status, 200);
+
+  auto db = raw_connect();
+  const auto record = repo().find_by_key(*db, key);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->status, persistence::RecordStatus::Completed);
+  EXPECT_EQ(record->fencing_epoch, 2);
+
+  const test::HttpResult replay = post_ops(server.port(), key, R"({"o":1})");
+  EXPECT_EQ(replay.status, 200);
+  EXPECT_EQ(replay.body, result.body);
+}
+
+TEST_F(PgFixture, NullLeasesFailClosedWithoutCreatingOrphans) {
+  // A service with no lease manager cannot take ownership: first requests
+  // fail closed (503 redis_unavailable) and, critically, NO durable row is
+  // created — fail-closed must not orphan PROCESSING rows.
+  REQUIRE_PG();
+  apex::observability::Logger quiet(apex::observability::Level::Error);
+  auto leaseless = std::make_shared<idempotency::IdempotencyService>(
+      shared_pool(), quiet, /*leases=*/nullptr);
+  test::TestServer server(ops_config(), leaseless);
+
+  const std::string key = unique_key("nolease");
+  const test::HttpResult result = post_ops(server.port(), key, R"({"a":1})");
+  EXPECT_EQ(result.status, 503);
+  EXPECT_NE(result.body.find("redis_unavailable"), std::string::npos);
+
+  auto db = raw_connect();
+  EXPECT_FALSE(repo().find_by_key(*db, key).has_value()) << "fail-closed left an orphan";
 }
 
 TEST_F(PgFixture, SameKeyDifferentFingerprintIs409Conflict) {

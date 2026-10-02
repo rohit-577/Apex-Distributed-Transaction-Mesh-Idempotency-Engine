@@ -1,13 +1,14 @@
 {
   "name": "apex",
-  "version": "0.2.0",
-  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 1: durable state)",
+  "version": "0.3.0",
+  "description": "Apex - Distributed Transaction Mesh & Idempotency Engine (Phase 2: lease ownership + fencing)",
   "dependencies": [
     "boost-asio",
     "boost-beast",
     "gtest",
     "nlohmann-json",
     "libpq",
-    "openssl"
+    "openssl",
+    "redis-plus-plus"
   ]
 }

@@ -82,6 +82,16 @@ using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
 // instead of failing (ctest stays hermetic without Docker).
 [[nodiscard]] std::optional<std::string> pg_test_conninfo();
 
+// Redis endpoint for Redis-gated tests, from APEX_TEST_REDIS_HOST (required)
+// and APEX_TEST_REDIS_PORT (default 6379). nullopt when the host is unset:
+// same skip contract as PostgreSQL.
+struct RedisTestEndpoint {
+  std::string host;
+  std::uint16_t port{6379};
+};
+
+[[nodiscard]] std::optional<RedisTestEndpoint> redis_test_endpoint();
+
 class TestServer {
  public:
   explicit TestServer(config::Config config);

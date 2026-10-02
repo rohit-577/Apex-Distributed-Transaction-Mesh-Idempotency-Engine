@@ -31,4 +31,11 @@ class Logger {
   std::mutex mutex_;
 };
 
+// Safe representation of an opaque client key for logs: keys may embed
+// account data, so only a short prefix is logged, plus the length for
+// disambiguation. Fingerprints (hashes) are always safe in full; request
+// bodies are never logged. Shared by the idempotency service and the lease
+// manager so the policy cannot drift between layers.
+[[nodiscard]] std::string safe_key(const std::string& key);
+
 }  // namespace apex::observability

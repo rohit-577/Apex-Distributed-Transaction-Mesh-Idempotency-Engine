@@ -26,24 +26,21 @@ Every invariant is numbered so tests and code can reference it (e.g.
 
 ## Declared for later phases (not yet enforced — no coordination layer exists)
 
-- **INV-06 — Single execution per idempotency key.** Concurrent duplicates
-  attach as waiters to one in-flight execution; the business operation runs
-  at most once per key per fencing epoch. *Phase 1 status: the durable half
-  holds (one `PROCESSING` row per key decides a single executor); waiter
-  attach and cross-process ownership are later-phase work.*
-- **INV-07 — Waiters never trust notification alone.** A wake-up (Redis
-  pub/sub or otherwise) is a hint; the waiter re-reads the durable
-  PostgreSQL record and only returns after the record reaches a terminal
-  state. Missed notifications therefore delay but never corrupt.
-  *Unchanged: applies once notifications exist.*
-- **INV-08 — PostgreSQL is the sole source of truth.** Redis content is
-  always re-derivable; loss of Redis degrades performance, never correctness.
-  *Phase 1: trivially holds — nothing is stored in Redis at all.*
-- **INV-09 — Stale owners cannot overwrite.** Leases expire while owners may
-  still run; every state transition carries a fencing token (monotonic per
-  key, issued with the lease) and the durable compare-and-swap rejects
-  writes from superseded epochs. *Phase 1: the status-predicate UPDATE is
-  the single-writer guard; fencing epochs arrive with coordination (V002).*
+- **INV-06 — Single execution per idempotency key.** One ownership
+  generation executes per key: the Redis lease elects who may try, the
+  fencing epoch decides whose result counts. *Phase 2: enforced for the
+  execute-inline model (recovery generations execute at most once each;
+  concurrent duplicates of an active owner defer with 202 rather than
+  executing). Waiter attach (shared waiting) is the next phase.*
+- **INV-07 — Waiters never trust notification alone.** *(Unchanged, applies
+  once notifications exist — no notification mechanism in Phase 2.)*
+- **INV-08 — PostgreSQL is the sole source of truth.** *Phase 2: holds with
+  Redis live AND dead — replay/conflict/failed paths never touch Redis
+  (tested with Redis unavailable).*
+- **INV-09 — Stale owners cannot overwrite.** Every terminal transition
+  presents the owner's epoch IN the SQL predicate; TTL expiry is a liveness
+  hint only. *Phase 2: enforced (FENCING INVARIANT); fencing epochs are now
+  real, issued durably, tested T1–T7.*
 - **INV-10 — Exactly-once is scoped, never absolute.** The guarantee is
   stated as "the recorded *effect* applies once within the idempotency
   boundary (key + terminal record)"; retries outside that boundary are the
@@ -77,6 +74,24 @@ Every invariant is numbered so tests and code can reference it (e.g.
   pool holds connections, not state; every verdict comes from PostgreSQL.
   *Enforced by design (service keeps no request state); validated by tests
   that kill and recreate every handle between calls.*
+
+## Phase 2 — Enforced (lease ownership + fencing)
+
+- **INV-18 — Epochs are durable, per-key, and monotonic.** Generation 1 is
+  assigned by the creating INSERT; each recovery assigns previous + 1
+  inside a row-locked transaction. No process counter, no TTL, no timestamp
+  is ever an epoch. *Validated by F1–F3 (1 → 2 → 3, durably).*
+- **INV-19 — Exactly one winner per observed epoch.** Recovery is
+  compare-and-swap on the witnessed epoch (`SELECT … FOR UPDATE`, then
+  `UPDATE … AND fencing_epoch = $observed`); concurrent recoverers
+  serialize and all but the first get nullopt. *Validated by F8 (8
+  contenders, one winner, final epoch exactly 2).*
+- **INV-20 — FENCING INVARIANT: terminal transitions require the current
+  epoch, enforced in SQL.** `UPDATE … WHERE key AND status='PROCESSING'
+  AND fingerprint AND fencing_epoch=$N`. A superseded generation affects
+  zero rows; its result is discarded; the current generation's result
+  stands. The check is never application-only. *Validated by F4–F7, F9,
+  and the deterministic T1–T7 stale-owner race.*
 
 ## Non-invariants (explicitly NOT promised)
 

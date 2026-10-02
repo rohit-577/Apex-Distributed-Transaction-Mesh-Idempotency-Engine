@@ -23,6 +23,16 @@
 //                        (relative to the server working directory)
 //   APEX_REDIS_HOST      Coordination host (TCP-checked).  Default: 127.0.0.1
 //   APEX_REDIS_PORT      Coordination port.                Default: 6379
+//   APEX_REDIS_PASSWORD  Coordination password.            Default: "" (empty:
+//                        no password sent; never logged)
+//   APEX_REDIS_POOL_SIZE Redis connection pool size.       Default: 8 (1..64)
+//   APEX_LEASE_TTL_MS    Lease ownership window in ms.     Default: 10000
+//                        (1000..300000). NOT a correctness mechanism: TTL
+//                        expiry is a liveness hint; fencing epochs decide
+//                        ownership (INV-09, INV-18).
+//   APEX_REDIS_OP_TIMEOUT_MS Per-command Redis deadline.   Default: 2000
+//                        (100..60000). Bounds every lease operation so a dead
+//                        Redis delays but never hangs a worker.
 //   APEX_LOG_LEVEL       debug|info|warning|error.          Default: info
 
 #include <cstdint>
@@ -44,6 +54,10 @@ struct Config {
   std::string migrations_dir{"migrations"};
   std::string redis_host{"127.0.0.1"};
   std::uint16_t redis_port{6379};
+  std::string redis_password;
+  unsigned redis_pool_size{8};
+  unsigned lease_ttl_ms{10000};
+  unsigned redis_op_timeout_ms{2000};
   std::string log_level{"info"};
 
   // Baseline defaults (threads are fixed up to the hardware default).

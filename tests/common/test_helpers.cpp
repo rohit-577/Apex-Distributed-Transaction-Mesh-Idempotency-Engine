@@ -111,6 +111,53 @@ std::optional<std::string> pg_test_conninfo() {
 #endif
 }
 
+std::optional<RedisTestEndpoint> redis_test_endpoint() {
+  std::string host;
+#if defined(_WIN32)
+  char* buffer = nullptr;
+  std::size_t length = 0;
+  if (_dupenv_s(&buffer, &length, "APEX_TEST_REDIS_HOST") == 0 && buffer != nullptr) {
+    host = buffer;
+    std::free(buffer);
+  }
+#else
+  if (const char* value = std::getenv("APEX_TEST_REDIS_HOST"); value != nullptr) {
+    host = value;
+  }
+#endif
+  if (host.empty()) {
+    return std::nullopt;
+  }
+  RedisTestEndpoint endpoint{std::move(host), 6379};
+#if defined(_WIN32)
+  char* port_buffer = nullptr;
+  std::size_t port_length = 0;
+  if (_dupenv_s(&port_buffer, &port_length, "APEX_TEST_REDIS_PORT") == 0 &&
+      port_buffer != nullptr) {
+    const std::string port_text(port_buffer);
+    std::free(port_buffer);
+    try {
+      const int port = std::stoi(port_text);
+      if (port > 0 && port <= 65535) {
+        endpoint.port = static_cast<std::uint16_t>(port);
+      }
+    } catch (const std::exception&) {
+    }
+  }
+#else
+  if (const char* port_value = std::getenv("APEX_TEST_REDIS_PORT"); port_value != nullptr) {
+    try {
+      const int port = std::stoi(port_value);
+      if (port > 0 && port <= 65535) {
+        endpoint.port = static_cast<std::uint16_t>(port);
+      }
+    } catch (const std::exception&) {
+    }
+  }
+#endif
+  return endpoint;
+}
+
 HttpResult http_send_with_headers(const std::string& host, std::uint16_t port,
                                   boost::beast::http::verb method, const std::string& target,
                                   const std::string& body, const HttpHeaders& headers) {

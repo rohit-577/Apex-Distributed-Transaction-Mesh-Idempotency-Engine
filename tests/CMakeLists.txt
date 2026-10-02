@@ -10,14 +10,19 @@ add_executable(apex_tests
   unit/config_test.cpp
   unit/router_test.cpp
   unit/idempotency_contract_test.cpp
+  unit/lease_contract_test.cpp
   common/test_helpers.cpp
   common/pg_fixture.cpp
   integration/http_test.cpp
   integration/dependency_check_test.cpp
   integration/db_repository_test.cpp
   integration/http_operations_test.cpp
+  integration/lease_redis_test.cpp
+  integration/fencing_test.cpp
+  integration/cross_system_test.cpp
   concurrency/parallel_health_test.cpp
   concurrency/idempotency_race_test.cpp
+  concurrency/lease_recovery_stress_test.cpp
 )
 
 target_include_directories(apex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

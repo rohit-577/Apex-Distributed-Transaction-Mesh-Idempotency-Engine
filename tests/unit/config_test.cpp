@@ -157,5 +157,62 @@ TEST(ConfigTest, OutOfRangePortsFallBackToDefaults) {
   EXPECT_EQ(warnings.size(), 1u);
 }
 
+TEST(ConfigTest, CoordinationDefaultsAreValid) {
+  const Config cfg = Config::defaults();
+  EXPECT_TRUE(cfg.redis_password.empty());
+  EXPECT_EQ(cfg.redis_pool_size, 8u);
+  EXPECT_EQ(cfg.lease_ttl_ms, 10000u);
+  EXPECT_EQ(cfg.redis_op_timeout_ms, 2000u);
+  EXPECT_TRUE(cfg.validate().empty()) << cfg.validate();
+}
+
+TEST(ConfigTest, CoordinationBoundsAreEnforced) {
+  for (unsigned bad_pool : {0u, 65u}) {
+    Config cfg = Config::defaults();
+    cfg.redis_pool_size = bad_pool;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_pool;
+  }
+  for (unsigned bad_ttl : {0u, 999u, 300001u}) {
+    Config cfg = Config::defaults();
+    cfg.lease_ttl_ms = bad_ttl;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_ttl;
+  }
+  for (unsigned bad_timeout : {0u, 99u, 60001u}) {
+    Config cfg = Config::defaults();
+    cfg.redis_op_timeout_ms = bad_timeout;
+    EXPECT_FALSE(cfg.validate().empty()) << bad_timeout;
+  }
+  Config ok = Config::defaults();
+  ok.lease_ttl_ms = 1000;
+  ok.redis_op_timeout_ms = 100;
+  EXPECT_TRUE(ok.validate().empty());
+}
+
+TEST(ConfigTest, CoordinationEnvironmentOverridesAreHonored) {
+  test::EnvGuard password("APEX_REDIS_PASSWORD", "s3cret");
+  test::EnvGuard pool("APEX_REDIS_POOL_SIZE", "5");
+  test::EnvGuard ttl("APEX_LEASE_TTL_MS", "15000");
+  test::EnvGuard timeout("APEX_REDIS_OP_TIMEOUT_MS", "500");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_TRUE(warnings.empty());
+  EXPECT_EQ(cfg.redis_password, "s3cret");
+  EXPECT_EQ(cfg.redis_pool_size, 5u);
+  EXPECT_EQ(cfg.lease_ttl_ms, 15000u);
+  EXPECT_EQ(cfg.redis_op_timeout_ms, 500u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
+TEST(ConfigTest, InvalidCoordinationEnvironmentFallsBackWithWarnings) {
+  test::EnvGuard pool("APEX_REDIS_POOL_SIZE", "0");
+  test::EnvGuard ttl("APEX_LEASE_TTL_MS", "forever");
+
+  const auto [cfg, warnings] = Config::load_from_environment();
+  EXPECT_EQ(cfg.redis_pool_size, 8u);
+  EXPECT_EQ(cfg.lease_ttl_ms, 10000u);
+  EXPECT_EQ(warnings.size(), 2u);
+  EXPECT_TRUE(cfg.validate().empty());
+}
+
 }  // namespace
 }  // namespace apex::config

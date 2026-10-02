@@ -10,19 +10,20 @@ and failure. It is not a CRUD app and not a generic REST API: every design
 choice serves the question "what happens when the same write arrives twice,
 at the same time, while machines fail?"
 
-## Phase 1 scope (this document describes intent + current status)
+## Phase 2 scope (this document describes intent + current status)
 
-Phase 1 adds the **durable PostgreSQL-backed idempotency layer**: key
-validation, request fingerprinting, atomic record acquisition, terminal
-transitions, response replay, and conflict rejection — all exercised against
-a real database, all independent of Redis.
+Phase 2 adds **lease-based ownership and durable fencing**: single-instance
+Redis leases (`SET NX PX` + token-guarded Lua release), cryptographic owner
+tokens, `fencing_epoch` generations in PostgreSQL (V002), epoch-guarded
+terminal writes, and orphan recovery. Full mechanics in
+`docs/lease-and-fencing.md`.
 
-Explicitly NOT in Phase 1 (later phases): Redis coordination/leases/pub-sub,
-fencing epochs, waiter multiplexing, multi-node ownership, distributed
-recovery. A duplicate arriving while its record is `PROCESSING` gets a
-deliberate `202`, not a wait. This phase provides **durable idempotency
-state and atomic database-level coordination** — not distributed
-exactly-once execution (see INV-10).
+Explicitly NOT in Phase 2 (later phases): pub/sub notification, waiter
+multiplexing (active-owner duplicates still get `202`), Redlock/quorum,
+renewal, background orphan reaping, multi-node load balancing. This phase
+provides **durable idempotency with lease-based ownership and fencing** —
+not distributed exactly-once execution (see INV-10 and §11 of
+`docs/lease-and-fencing.md`).
 
 ## Topology today (Implemented, Validated)
 
@@ -33,17 +34,20 @@ HTTP client(s)
 C++ async gateway (Asio/Beast, I/O thread pool; NEVER blocks — INV-01)
       |  POST /v1/operations: validate -> fingerprint -> post to DB pool
       v
-Database worker threads (blocking allowed HERE only)
+Database worker threads (blocking allowed HERE only: PG + Redis alike)
       |
       v
 IdempotencyService -> IdempotencyRepository -> PostgreSQL 18 (libpq)
-      |                    (durable authority, INV-08/INV-17)
+      |       |             (durable authority, INV-08/INV-17, INV-20)
+      |       +----------> LeaseManager -> RedisClient -> Redis 7 (redis-plus-plus)
+      |                        (liveness only: apex:lease:<key>, TTL, tokens)
       v
 SimulatedOperation (deterministic stand-in for real work)
 ```
 
-Redis is still only TCP-probed for `/ready`. Nothing reads or writes Redis
-data in Phase 1.
+Redis holds lease liveness (single `redis:7` dev instance — stated plainly,
+not Redlock). Nothing replayable depends on it: terminal answers come from
+PostgreSQL without touching Redis.
 
 ## Module boundaries (Implemented unless marked)
 
@@ -57,12 +61,13 @@ data in Phase 1.
 | Persistence | `src/persistence/` | `PgConnection` (RAII libpq), `ConnectionPool` (bounded checkout), `IdempotencyRepository` (the only SQL), `Schema` (migration applier). No HTTP, no orchestration. | Implemented |
 | Observability | `src/observability/` | Tiny thread-safe stderr logger + transition logging with key-truncation policy (below). | Implemented |
 | Core | `src/core/` | Phase constants. | Implemented (minimal) |
-| Coordination | `src/coordination/` | Redis leases, fencing, notification. | Planned (later phase) |
+| Coordination | `src/coordination/` | `RedisClient` (only Redis connections in the codebase), `LeaseManager` (`SET NX PX`, Lua compare-delete, owner tokens). No pub/sub yet. | Implemented |
 | Concurrency | `src/concurrency/` | In-flight map, waiter multiplexing. | Planned (later phase) |
 
-Rules: I/O threads never block (DB work hops to the pool and posts back);
-persistence never imports networking; the pool holds no state and makes no
-decisions (INV-17). No global mutable state anywhere.
+Rules: I/O threads never block (DB *and* Redis work hop to the pool and
+post back); persistence never imports networking; coordination never imports
+SQL or HTTP; the pools hold no state and make no decisions (INV-17). No
+global mutable state anywhere.
 
 ## Request contract: POST /v1/operations (Implemented, Validated)
 
@@ -85,12 +90,15 @@ decisions (INV-17). No global mutable state anywhere.
 | Situation | Response |
 |---|---|
 | Missing / invalid key, invalid JSON | `400` with a machine-readable `error` |
-| First request (acquire wins) | Executes now → `200` (or `500` when the op itself fails) |
-| Duplicate, same fingerprint, `PROCESSING` | `202 {"status":"processing"}` — deliberate, no waiting |
-| Duplicate, same fingerprint, `COMPLETED` | Stored `http_status` + body replayed byte-identically |
+| First request (lease won, epoch 1) | Executes now → `200` (or `500` when the op itself fails) |
+| Duplicate, same fingerprint, lease held (active owner) | `202 {"status":"processing"}` — deliberate, no waiting |
+| Duplicate, same fingerprint, lease free (orphan) | Recovers to epoch N+1, executes → `200` |
+| Duplicate, same fingerprint, `COMPLETED` | Stored `http_status` + body replayed byte-identically (no Redis touched) |
 | Duplicate, same fingerprint, `FAILED` | `409 idempotency_already_failed` with the original failure |
+| Superseded owner commits late | `409 stale_ownership_epoch`; current result stands |
 | Same key, different fingerprint | `409 idempotency_key_in_use` — never executed as the original |
 | Database unreachable | `503 storage_unavailable`; gateway stays up (`/health` unaffected) |
+| Redis unreachable (ownership needed) | `503 redis_unavailable`; fail closed, nothing created |
 | Wrong method on the route | `405` + `Allow: POST` |
 
 ## Request lifecycle today (Implemented, Validated by tests)
@@ -145,8 +153,28 @@ enough to correlate, the fingerprint is enough to identify the request.
    repo's directory name). The manifest stays the single source of truth;
    only the local artifact directory moves. See `scripts/configure.ps1`.
 
+## Decisions made in Phase 2
+
+1. **redis-plus-plus (sync) for coordination.** Async-first clients
+   (cpp-redis) and Asio-native ones (boost-redis) mismatch the
+   block-on-workers model; raw hiredis would need hand-rolled pooling.
+   redis-plus-plus gives pooled sync commands, `EVAL` for the release
+   script, and a future `Subscriber` for pub/sub — used from worker
+   threads only. (vcpkg `redis-plus-plus`, CMake `redis++::redis++`.)
+2. **Lease-first, then row.** Redis `SET NX PX` precedes the PostgreSQL
+   INSERT so a dead coordinator creates no orphan rows; losers defer with
+   `202` without touching the database.
+3. **Replay paths never touch Redis.** Terminal/conflict answers come from
+   the row alone — Redis outage degrades ownership, never replay.
+4. **Always-release leases (RAII).** No lease handoff exists in Phase 2, so
+   every exit path releases; token-guarded no-throw release makes this
+   unconditionally safe. TTL remains the backstop.
+5. **No renewal, no version table.** Renewal buys nothing while epochs
+   decide correctness; the two-file ordered migration list stays until the
+   count justifies a runner.
+
 ## Deliberately deferred
 
-- Redis client/leases/pub-sub/streams, fencing tokens/epochs, waiter
-  registry/multiplexing, multi-node coordination, distributed recovery,
-  key expiry/GC, metrics/tracing, TLS, auth, rate limiting, benchmarks.
+- Redis pub/sub/streams, waiter registry/multiplexing, renewal, Redlock or
+  any multi-instance Redis, background orphan reaping, key expiry/GC,
+  metrics/tracing, TLS, auth, rate limiting, benchmarks.

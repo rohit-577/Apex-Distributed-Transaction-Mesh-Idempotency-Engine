@@ -67,7 +67,7 @@ TEST_F(PgFixture, CompleteStoresReplayableResponse) {
   auto db = raw_connect();
   EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
 
-  EXPECT_TRUE(repo().complete(*db, key, kFpA, 200, R"({"result":"ok"})", "application/json"));
+  EXPECT_TRUE(repo().complete(*db, key, kFpA, 1, 200, R"({"result":"ok"})", "application/json"));
 
   const std::optional<IdempotencyRecord> found = repo().find_by_key(*db, key);
   ASSERT_TRUE(found.has_value());
@@ -86,10 +86,10 @@ TEST_F(PgFixture, TerminalWritesAreIdempotentGuards) {
   const std::string key = unique_key("terminal");
   auto db = raw_connect();
   EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
-  ASSERT_TRUE(repo().complete(*db, key, kFpA, 200, "first", "application/json"));
+  ASSERT_TRUE(repo().complete(*db, key, kFpA, 1, 200, "first", "application/json"));
 
-  EXPECT_FALSE(repo().complete(*db, key, kFpA, 200, "second", "application/json"));
-  EXPECT_FALSE(repo().fail(*db, key, kFpA, "late", "too late"));
+  EXPECT_FALSE(repo().complete(*db, key, kFpA, 1, 200, "second", "application/json"));
+  EXPECT_FALSE(repo().fail(*db, key, kFpA, 1, "late", "too late"));
 
   const std::optional<IdempotencyRecord> found = repo().find_by_key(*db, key);
   ASSERT_TRUE(found.has_value());
@@ -103,9 +103,9 @@ TEST_F(PgFixture, FailTransitionAndFailedIsTerminal) {
   auto db = raw_connect();
   EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
 
-  EXPECT_TRUE(repo().fail(*db, key, kFpA, "simulated_failure", "asked to fail"));
-  EXPECT_FALSE(repo().fail(*db, key, kFpA, "again", "again"));
-  EXPECT_FALSE(repo().complete(*db, key, kFpA, 200, "late", "application/json"));
+  EXPECT_TRUE(repo().fail(*db, key, kFpA, 1, "simulated_failure", "asked to fail"));
+  EXPECT_FALSE(repo().fail(*db, key, kFpA, 1, "again", "again"));
+  EXPECT_FALSE(repo().complete(*db, key, kFpA, 1, 200, "late", "application/json"));
 
   const std::optional<IdempotencyRecord> found = repo().find_by_key(*db, key);
   ASSERT_TRUE(found.has_value());
@@ -121,7 +121,7 @@ TEST_F(PgFixture, TerminalWriteWithWrongFingerprintAffectsZeroRows) {
   auto db = raw_connect();
   EXPECT_EQ(repo().try_acquire(*db, key, kFpA).outcome, AcquireOutcome::Created);
 
-  EXPECT_FALSE(repo().complete(*db, key, kFpB, 200, "wrong", "application/json"));
+  EXPECT_FALSE(repo().complete(*db, key, kFpB, 1, 200, "wrong", "application/json"));
   EXPECT_EQ(repo().find_by_key(*db, key)->status, RecordStatus::Processing);
 }
 
@@ -245,7 +245,8 @@ TEST_F(PgFixture, PoolRecyclesConnectionsAcrossCheckouts) {
   }  // Guard returns the connection here.
   {
     persistence::ConnectionPool::Guard second = pool().acquire();
-    EXPECT_TRUE(repo().complete(second.connection(), key, kFpA, 200, "{}", "application/json"));
+    EXPECT_TRUE(
+        repo().complete(second.connection(), key, kFpA, 1, 200, "{}", "application/json"));
   }
   auto db = raw_connect();
   EXPECT_EQ(repo().find_by_key(*db, key)->status, RecordStatus::Completed);

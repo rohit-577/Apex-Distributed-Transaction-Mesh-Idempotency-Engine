@@ -66,4 +66,12 @@ const char* Logger::to_string(Level level) {
   return "UNKNOWN";
 }
 
+std::string safe_key(const std::string& key) {
+  constexpr std::size_t kLoggedKeyPrefix = 16;
+  if (key.size() <= kLoggedKeyPrefix) {
+    return key;
+  }
+  return key.substr(0, kLoggedKeyPrefix) + "...(len=" + std::to_string(key.size()) + ")";
+}
+
 }  // namespace apex::observability

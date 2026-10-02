@@ -65,9 +65,10 @@ and measured performance outrank features.
 
 ## 7. Scope discipline
 
-- Stay in the current phase. Phase 1 = durable idempotency state only; do
-  not implement Redis coordination, leases, waiter multiplexing, fencing
-  epochs, or distributed recovery until the user opens the next phase.
+- Stay in the current phase. Phase 2 = Redis lease ownership + durable
+  fencing epochs only; do not implement pub/sub, waiter multiplexing,
+  Redlock, or distributed recovery beyond orphan-epoch advancement until
+  the user opens the next phase.
 - Keep changes scoped; do not reformat unrelated files; do not touch the
   workspace `.venv/` (unrelated to this C++ project).
 - No TODO placeholders pretending to be implementations. Unfinished work is

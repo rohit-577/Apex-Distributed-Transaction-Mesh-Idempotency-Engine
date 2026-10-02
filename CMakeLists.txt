@@ -1,6 +1,6 @@
 # Apex — Distributed Transaction Mesh & Idempotency Engine
-# Phase 1: durable PostgreSQL-backed idempotency state (no Redis coordination,
-# no leases, no multiplexing — those are later phases).
+# Phase 2: Redis lease ownership + durable fencing epochs (no pub/sub, no
+# waiter multiplexing, no Redlock — those are later phases).
 #
 # Configure (Visual Studio generator is the supported default on Windows):
 #   cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
@@ -19,7 +19,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(Apex
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "Distributed Transaction Mesh & Idempotency Engine"
   LANGUAGES CXX
 )
@@ -34,11 +34,16 @@ option(APEX_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 find_package(boost_asio CONFIG REQUIRED)
 find_package(boost_beast CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
-# libpq (durable state) + OpenSSL (SHA-256 for request fingerprints).
-# Provided by vcpkg: libpq via FindPostgreSQL wrapper, OpenSSL via its
-# official config. See scripts/configure.ps1 for the installed-tree path fix.
+# libpq (durable state) + OpenSSL (SHA-256 for request fingerprints and
+# lease owner tokens). Provided by vcpkg: libpq via FindPostgreSQL wrapper,
+# OpenSSL via its official config. See scripts/configure.ps1 for the
+# installed-tree path fix.
 find_package(PostgreSQL REQUIRED)
 find_package(OpenSSL REQUIRED)
+# redis-plus-plus (lease coordination): sync API used from database worker
+# threads only, never from Asio I/O threads. Rationale in
+# docs/lease-and-fencing.md.
+find_package(redis++ CONFIG REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Shared warning policy. MSVC /W4 is the baseline; warnings-as-errors is
@@ -71,6 +76,8 @@ add_library(apex_core STATIC
   src/persistence/ConnectionPool.cpp
   src/persistence/IdempotencyRepository.cpp
   src/persistence/Schema.cpp
+  src/coordination/RedisClient.cpp
+  src/coordination/LeaseManager.cpp
 )
 
 target_include_directories(apex_core PUBLIC src)
@@ -80,6 +87,7 @@ target_link_libraries(apex_core PUBLIC
   Boost::beast
   nlohmann_json::nlohmann_json
   PostgreSQL::PostgreSQL
+  redis++::redis++
 )
 
 # OpenSSL::Crypto is implementation-only (Fingerprint.cpp); PRIVATE keeps it
@@ -119,7 +127,7 @@ if(APEX_WARNINGS_AS_ERRORS AND MSVC)
   target_compile_options(apex PRIVATE /WX)
 endif()
 
-target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase1")
+target_compile_definitions(apex PRIVATE APEX_VERSION="${PROJECT_VERSION}-phase2")
 
 # ---------------------------------------------------------------------------
 # Tests (separate target tree; see tests/CMakeLists.txt).
