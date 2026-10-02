@@ -32,6 +32,13 @@ struct MetricsSnapshot {
   std::uint64_t waiters_started{0};
   std::uint64_t waiter_timeouts{0};
   std::uint64_t waiter_aborted{0};
+  // Waiters that converged on a terminal result after waiting (as opposed to
+  // immediate replay: those never suspend). wait_time_ms_total accumulates
+  // their suspended durations (mean derivable; no histogram by design).
+  std::uint64_t waiter_completions{0};
+  std::uint64_t wait_time_ms_total{0};
+  // Currently suspended waiters (gauge, not cumulative).
+  std::uint64_t waiters_active{0};
   // Ownership.
   std::uint64_t lease_acquired{0};
   std::uint64_t lease_held{0};
@@ -77,6 +84,10 @@ class Metrics {
   void increment_waiters_started() { ++waiters_started_; }
   void increment_waiter_timeouts() { ++waiter_timeouts_; }
   void increment_waiter_aborted() { ++waiter_aborted_; }
+  void increment_waiter_completions() { ++waiter_completions_; }
+  void add_wait_time_ms(std::uint64_t ms) { wait_time_ms_total_ += ms; }
+  void increment_waiters_active() { ++waiters_active_; }
+  void decrement_waiters_active() { --waiters_active_; }
   void increment_lease_acquired() { ++lease_acquired_; }
   void increment_lease_held() { ++lease_held_; }
   void increment_lease_unavailable() { ++lease_unavailable_; }
@@ -115,6 +126,9 @@ class Metrics {
   std::atomic<std::uint64_t> waiters_started_{0};
   std::atomic<std::uint64_t> waiter_timeouts_{0};
   std::atomic<std::uint64_t> waiter_aborted_{0};
+  std::atomic<std::uint64_t> waiter_completions_{0};
+  std::atomic<std::uint64_t> wait_time_ms_total_{0};
+  std::atomic<std::uint64_t> waiters_active_{0};
   std::atomic<std::uint64_t> lease_acquired_{0};
   std::atomic<std::uint64_t> lease_held_{0};
   std::atomic<std::uint64_t> lease_unavailable_{0};

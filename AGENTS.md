@@ -65,12 +65,9 @@ and measured performance outrank features.
 
 ## 7. Scope discipline
 
-- Stay in the current phase. Phases 4–6 combined execution is authorized:
-  Phase 4 = resilience hardening (background reaper, cancellation,
-  reconnect/restart, shutdown order) without weakening Phases 0–3; Phase 5
-  = observability (correlation, metrics, ops docs); Phase 6 = honest
-  benchmarks + final audit. Do not implement Redlock, Streams, Cluster,
-  TLS/auth, Kubernetes, or any post-Phase-6 work.
+- Project complete through Phase 6 (see docs/FINAL_ENGINEERING_AUDIT.md).
+  Maintain and fix; do not start new phases, features, or refactors without
+  explicit user instruction.
 - Keep changes scoped; do not reformat unrelated files; do not touch the
   workspace `.venv/` (unrelated to this C++ project).
 - No TODO placeholders pretending to be implementations. Unfinished work is

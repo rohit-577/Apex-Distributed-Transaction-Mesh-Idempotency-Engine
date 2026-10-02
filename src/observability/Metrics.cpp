@@ -15,6 +15,9 @@ MetricsSnapshot Metrics::snapshot() const {
   snap.waiters_started = waiters_started_.load();
   snap.waiter_timeouts = waiter_timeouts_.load();
   snap.waiter_aborted = waiter_aborted_.load();
+  snap.waiter_completions = waiter_completions_.load();
+  snap.wait_time_ms_total = wait_time_ms_total_.load();
+  snap.waiters_active = waiters_active_.load();
   snap.lease_acquired = lease_acquired_.load();
   snap.lease_held = lease_held_.load();
   snap.lease_unavailable = lease_unavailable_.load();
@@ -58,6 +61,9 @@ std::string Metrics::render_prometheus() const {
   line("waiters_started", snap.waiters_started);
   line("waiter_timeouts", snap.waiter_timeouts);
   line("waiter_aborted", snap.waiter_aborted);
+  line("waiter_completions", snap.waiter_completions);
+  line("wait_time_ms_total", snap.wait_time_ms_total);
+  out << "# TYPE apex_waiters_active gauge\napex_waiters_active " << snap.waiters_active << "\n";
   line("lease_acquired", snap.lease_acquired);
   line("lease_held", snap.lease_held);
   line("lease_unavailable", snap.lease_unavailable);

@@ -60,7 +60,16 @@ void OrphanReaper::run() {
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stop_) {
     lock.unlock();
-    run_pass();
+    try {
+      run_pass();
+    } catch (const std::exception& e) {
+      // Background coordination thread: never die on a pass failure.
+      // run_pass already funnels expected failures into warnings; this is
+      // the backstop for the unexpected.
+      logger_.error(std::string("orphan-reaper pass failed unexpectedly: ") + e.what());
+    } catch (...) {
+      logger_.error("orphan-reaper pass failed with unknown error");
+    }
     lock.lock();
     wake_.wait_for(lock, std::chrono::milliseconds(options_.interval_ms),
                    [this] { return stop_; });

@@ -1,5 +1,7 @@
 #include "coordination/LeaseManager.hpp"
 
+#include <stdexcept>
+
 #include <openssl/rand.h>
 
 #include "coordination/RedisClient.hpp"
@@ -105,6 +107,14 @@ bool LeaseManager::release(const std::string& idempotency_key, const std::string
   } catch (const RedisError& e) {
     logger_.error("lease key=" + logged + " release failed (Redis unavailable): " + e.what());
     metrics_->increment_redis_failures();
+    return false;
+  } catch (const std::exception& e) {
+    // Belt-and-braces: release() runs inside ~LeaseReleaser (implicitly
+    // noexcept), so NOTHING may escape — not even a non-Redis failure.
+    logger_.error("lease key=" + logged + " release failed unexpectedly: " + e.what());
+    return false;
+  } catch (...) {
+    logger_.error("lease key=" + logged + " release failed with unknown error");
     return false;
   }
 }

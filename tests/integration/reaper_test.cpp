@@ -292,5 +292,67 @@ TEST_F(PgFixture, ReaperStopsPromptlyOnShutdown) {
   EXPECT_EQ(reaper.passes(), passes_at_stop) << "stopped reaper ran another pass";
 }
 
+TEST_F(PgFixture, ShutdownWithOwnerWaitersAndReaperExitsCleanly) {
+  // Full shutdown stack under load: gated owner mid-execution, suspended
+  // waiters, and a running reaper - then server teardown, reaper stop, and
+  // a fresh server on the same service. Must return (no hang), leak nothing,
+  // and keep serving. Mirrors main()'s shutdown order at fixture scale.
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  NodeBundle node = make_node(/*gate_open=*/false);
+  GateOpener guard(*node.executor);
+  apex::observability::Logger quiet(apex::observability::Level::Error);
+  recovery::OrphanReaper reaper(node.service, shared_pool(), quiet, fast_reaper_options(),
+                                shared_metrics());
+  reaper.start();
+
+  const std::string key = unique_key("reaper-shutdown");
+  const std::string body = R"({"reap":"shutdown"})";
+  const std::string channel = idempotency::WaiterRegistry::channel_for(key, fp_of(body));
+
+  int owner_status = 0;
+  {
+    test::TestServer server(reaper_config(), node.service);
+    const std::uint16_t port = server.port();
+    std::thread real_owner([&] {
+      owner_status = post_key(port, key, body).status;
+    });
+    ASSERT_TRUE(wait_until([&] { return node.executor->executions() == 1; }));
+
+    constexpr int kWaiters = 3;
+    std::vector<std::thread> waiters;
+    for (int i = 0; i < kWaiters; ++i) {
+      waiters.emplace_back([&] {
+        try {
+          (void)post_key(port, key, body);
+        } catch (const std::exception&) {
+          // Teardown may drop connections: acceptable, counted nowhere.
+        }
+      });
+    }
+    ASSERT_TRUE(wait_until([&] {
+      return node.registry->waiter_count(channel) == static_cast<std::size_t>(kWaiters);
+    })) << "waiters never suspended";
+    // Destroy the server with owner + waiters + reaper all active, then let
+    // the owner finish: every thread must join (no hang, no terminate).
+    node.executor->open_gate();
+    real_owner.join();
+    for (auto& waiter : waiters) {
+      waiter.join();
+    }
+    EXPECT_EQ(owner_status, 200);
+  }
+  reaper.stop();
+
+  // Same stack serves cleanly afterwards; the owned row is terminal.
+  {
+    test::TestServer server(reaper_config(), node.service);
+    EXPECT_EQ(post_key(server.port(), unique_key("reaper-after"), R"({"ok":1})").status,
+              200);
+    EXPECT_EQ(post_key(server.port(), key, body).status, 200);
+  }
+  EXPECT_EQ(node.registry->waiter_count(channel), 0u);
+}
+
 }  // namespace
 }  // namespace apex

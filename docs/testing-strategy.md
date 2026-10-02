@@ -1,8 +1,9 @@
 # Apex Testing Strategy
 
-Status: **unit / integration / concurrency Implemented and passing (133
-tests), including the live-PostgreSQL + live-Redis multiplexing matrix;
-benchmark harnesses Planned.**
+Status: **unit / integration / concurrency Implemented and passing (162
+tests), including the live-PostgreSQL + live-Redis matrix, resilience
+(docker-gated), migration lifecycle, and metrics coverage; `apex_bench`
+(Phase 6) measures with correctness gates but is not part of `ctest` timing.**
 
 ## Layers
 
@@ -14,7 +15,7 @@ benchmark harnesses Planned.**
 | Failure (DB scope) | `tests/integration/db_repository_test.cpp` | Rollback, duplicate-insert race (23505), malformed rows (23514), invalid transitions, unreachable DB. Each ends in a verified consistent state. | Same gating as above |
 | Failure (cross-system) | `tests/integration/cross_system_test.cpp` | Lease-without-row, epoch-without-execution, T1–T7 stale-owner race, Redis-down ownership, PG-kill mid-transaction. Each names expected state, retry safety, recoverability. | Live PG+Redis |
 | Failure (distributed) | `tests/failure/` (Planned) | Partitions, multi-node sieges (beyond single-instance scope). | Yes for full-matrix runs |
-| Benchmark | `tests/benchmark/` (Planned) | Throughput/latency harness, p50/p99. Numbers only from real runs. | Yes |
+| Benchmark | `tests/benchmark/apex_bench` | Throughput/latency harness (A–H + soak), p50/p95/p99, every scenario gated on execution counts. Run via `scripts/bench.ps1`; results in `docs/benchmarking.md`. | Yes |
 | Infra smoke | `scripts/infra-smoke.ps1` | `docker compose` stack becomes healthy and is reachable from the host. Run manually / in CI, not in `ctest`. | Yes |
 
 ## Rules (binding)

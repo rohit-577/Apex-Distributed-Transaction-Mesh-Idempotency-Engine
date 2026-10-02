@@ -91,8 +91,11 @@ class Session : public std::enable_shared_from_this<Session> {
   void enter_wait(idempotency::OperationRequest request, unsigned version, bool keep_alive);
   void continue_wait();
   void recheck_now();
+  // Re-registers for another wait cycle (notify erases slots). False means
+  // shutdown/cap: settle 202 immediately.
+  bool reregister_for_wait();
   void on_recheck_result(const idempotency::OperationOutcome& outcome);
-  void on_wait_timer(boost::beast::error_code ec);
+  void on_wait_timer(boost::beast::error_code ec, std::uint64_t generation);
   void on_wait_wake();
   void settle_wait(int status, const std::string& body);
   void settle_wait_timeout();
@@ -114,7 +117,11 @@ class Session : public std::enable_shared_from_this<Session> {
     unsigned http_version{11};
     bool keep_alive{false};
     std::chrono::steady_clock::time_point deadline{};
+    std::chrono::steady_clock::time_point wait_start{};
     bool settled{false};
+    // True while counted in apex_waiters_active (set when the fallback
+    // timer arms = truly suspended; cleared on every exit path exactly once).
+    bool counts_active{false};
   };
 
   boost::beast::tcp_stream stream_;
@@ -129,6 +136,12 @@ class Session : public std::enable_shared_from_this<Session> {
   observability::Logger& logger_;
   boost::asio::steady_timer wait_timer_;
   std::optional<PendingWait> pending_wait_;
+  // Timer generation: every arm bumps it; handlers carrying a stale
+  // generation no-op. Without this, arming a second wait while a first is
+  // still pending would cancel it, and the cancellation handler would tear
+  // down the new cycle's state (orphaning the waiter with no timer and no
+  // registration). Strand-confined, plain integer.
+  std::uint64_t wait_timer_generation_{0};
   // Per-request correlation ID (operations route only). Echoed back as the
   // X-Request-ID response header; never part of the fingerprint.
   std::string correlation_id_;

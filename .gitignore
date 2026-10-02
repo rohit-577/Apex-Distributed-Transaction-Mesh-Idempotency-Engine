@@ -40,5 +40,8 @@ Testing/
 *.gcno
 coverage/
 
+# Ad-hoc run logs (server output, test reruns)
+*.log
+
 # Python virtualenv in the workspace root is unrelated to this C++ project.
 # It is intentionally left untouched and is NOT covered by this ignore file.

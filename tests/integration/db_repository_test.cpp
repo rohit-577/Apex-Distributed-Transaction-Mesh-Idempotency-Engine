@@ -3,10 +3,11 @@
 // terminal-state guards are only meaningful against the actual database.
 
 #include <atomic>
+#include <chrono>
 #include <latch>
 #include <string>
 #include <thread>
-
+#include <vector>
 #include <gtest/gtest.h>
 
 #include "common/pg_fixture.hpp"
@@ -250,6 +251,39 @@ TEST_F(PgFixture, PoolRecyclesConnectionsAcrossCheckouts) {
   }
   auto db = raw_connect();
   EXPECT_EQ(repo().find_by_key(*db, key)->status, RecordStatus::Completed);
+}
+
+TEST_F(PgFixture, SmallPoolServesConcurrentCheckoutsWithoutDeadlock) {
+  // Pool contention (Phase 4.6): more contenders than connections, each
+  // holding briefly. All must complete — no deadlock, no starvation, every
+  // checkout exclusive (a shared-connection pool would corrupt here).
+  REQUIRE_PG();
+  auto tight_pool = std::make_shared<ConnectionPool>(
+      *test::pg_test_conninfo(), /*max_size=*/2);
+  constexpr int kContenders = 8;
+  std::atomic<int> completed{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kContenders; ++i) {
+    threads.emplace_back([&, i] {
+      auto guard = tight_pool->acquire();
+      // Exclusive ownership proof: set a session-local marker and read it
+      // back. A shared connection would interleave these across threads.
+      // (is_local=false: persists for the session, so a cross-thread read
+      // proves the same backend served both statements of this checkout.)
+      const std::string marker = "t" + std::to_string(i);
+      (void)guard.connection().exec_params("SELECT set_config('apex.probe', $1, false)",
+                                            {marker});
+      const PgResult check =
+          guard.connection().exec_params("SELECT current_setting('apex.probe')", {});
+      EXPECT_EQ(check.value(0, 0), marker);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      ++completed;
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(completed.load(), kContenders);
 }
 
 }  // namespace

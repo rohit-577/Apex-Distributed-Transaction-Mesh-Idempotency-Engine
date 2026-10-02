@@ -71,6 +71,10 @@ Session::~Session() {
     return;
   }
   service_->metrics()->increment_waiter_cancellations();
+  if (pending_wait_->counts_active) {
+    pending_wait_->counts_active = false;
+    service_->metrics()->decrement_waiters_active();
+  }
   if (pending_wait_->waiter_id != 0 && service_ != nullptr) {
     service_->registry()->unregister(pending_wait_->channel, pending_wait_->waiter_id);
   }
@@ -295,6 +299,7 @@ void Session::enter_wait(idempotency::OperationRequest request, unsigned version
   wait.keep_alive = keep_alive;
   wait.deadline = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(options.timeout_ms);
+  wait.wait_start = std::chrono::steady_clock::now();
   wait.settled = false;
   pending_wait_ = std::move(wait);
   service_->metrics()->increment_waiters_started();
@@ -323,6 +328,29 @@ void Session::continue_wait() {
     settle_wait_timeout();
     return;
   }
+  if (!reregister_for_wait()) {
+    // Shutdown or per-key cap: transient 202, durable state untouched.
+    settle_wait(202, waiter_timeout_body(true));
+    return;
+  }
+  // Mandatory immediate re-check (never "register then sleep"): decides from
+  // PostgreSQL truth as of NOW. A later wake or the fallback timer drives
+  // the next cycle if still PROCESSING.
+  recheck_now();
+}
+
+// Re-registers the waiter for another cycle (after a wake or timeout fired
+// without settling). Returns false when registration is refused (shutdown
+// or per-key cap), in which case the caller settles 202 immediately.
+bool Session::reregister_for_wait() {
+  if (!pending_wait_ || pending_wait_->settled) {
+    return false;
+  }
+  PendingWait& wait = *pending_wait_;
+  auto registry = service_->registry();
+  if (registry->is_shutdown()) {
+    return false;
+  }
   if (wait.waiter_id != 0) {
     registry->unregister(wait.channel, wait.waiter_id);
     wait.waiter_id = 0;
@@ -339,15 +367,10 @@ void Session::continue_wait() {
         });
       });
   if (receipt.rejected) {
-    // Shutdown or per-key cap: transient 202, durable state untouched.
-    settle_wait(202, waiter_timeout_body(true));
-    return;
+    return false;
   }
   wait.waiter_id = receipt.waiter_id;
-  // Mandatory immediate re-check (never "register then sleep"): decides from
-  // PostgreSQL truth as of NOW. A later wake or the fallback timer drives
-  // the next cycle if still PROCESSING.
-  recheck_now();
+  return true;
 }
 
 void Session::recheck_now() {
@@ -379,11 +402,42 @@ void Session::on_recheck_result(const idempotency::OperationOutcome& outcome) {
   if (!pending_wait_ || pending_wait_->settled) {
     return;
   }
-  if (outcome.kind == idempotency::OperationOutcome::Kind::Wait) {
-    // Still owned elsewhere. Deadline FIRST: a waiter that outlasts its
-    // maximum duration answers 202 without touching durable state
-    // (INV-MUX-06) — this check must live on every Wait continuation, not
-    // just at registration, or the waiter would re-arm forever.
+  using Kind = idempotency::OperationOutcome::Kind;
+  if (outcome.kind == Kind::RedisUnavailable || outcome.kind == Kind::StorageUnavailable) {
+    // Transient dependency failure DURING an active wait (as opposed to the
+    // initial verdict, which fails fast): ride it out on the fallback timer
+    // instead of settling. Critically this ARMS THE TIMER rather than
+    // re-checking immediately: an immediate loop would spin connection
+    // attempts at full speed for the whole outage (a self-inflicted storm
+    // that exhausts sockets and destabilizes the process). The deadline
+    // still bounds the total wait.
+    logger_wait_event("transient-unavailable");
+  } else if (outcome.kind != Kind::Wait) {
+    // A waiter converging on a terminal result: count the completion and its
+    // suspended duration (mean time-to-converge is derivable; no histogram
+    // by design).
+    service_->metrics()->increment_waiter_completions();
+    service_->metrics()->add_wait_time_ms(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pending_wait_->wait_start)
+                .count()));
+    logger_wait_event("completed");
+    settle_wait(outcome.http_status, outcome.body);
+    return;
+  }
+  // Still owned elsewhere (or riding out a blip above). Re-register so the
+  // NEXT wake finds this waiter (notify erases slots), then deadline-check
+  // and re-arm below. Skipping re-registration would silently downgrade the
+  // waiter to polling-only after its first wake.
+  if (!reregister_for_wait()) {
+    settle_wait(202, waiter_timeout_body(true));
+    return;
+  }
+  // Deadline: a waiter that outlasts its maximum duration answers 202
+  // without touching durable state (INV-MUX-06) — checked on every cycle,
+  // or the waiter would re-arm forever.
+  {
     PendingWait& wait = *pending_wait_;
     if (std::chrono::steady_clock::now() >= wait.deadline) {
       settle_wait_timeout();
@@ -403,15 +457,23 @@ void Session::on_recheck_result(const idempotency::OperationOutcome& outcome) {
     }
     wait_timer_.expires_after(interval);
     auto self = shared_from_this();
-    wait_timer_.async_wait([self](boost::beast::error_code ec) { self->on_wait_timer(ec); });
-    return;
+    const std::uint64_t generation = ++wait_timer_generation_;
+    wait_timer_.async_wait(
+        [self, generation](boost::beast::error_code ec) { self->on_wait_timer(ec, generation); });
+    // Suspended now (timer armed): count in the active gauge until any exit
+    // path below clears it exactly once (guarded: re-arms must not recount).
+    if (!wait.counts_active) {
+      wait.counts_active = true;
+      service_->metrics()->increment_waiters_active();
+    }
   }
-  logger_wait_event("completed");
-  settle_wait(outcome.http_status, outcome.body);
 }
 
-void Session::on_wait_timer(boost::beast::error_code ec) {
+void Session::on_wait_timer(boost::beast::error_code ec, std::uint64_t generation) {
   // Strand context.
+  if (generation != wait_timer_generation_) {
+    return;  // Superseded by a newer arm: do nothing (no abort, no recheck).
+  }
   if (ec == boost::asio::error::operation_aborted) {
     // Timer cancelled by shutdown/ioc-stop: release the registration and
     // die silently (no response possible on a stopping loop).
@@ -445,6 +507,10 @@ void Session::settle_wait(int status, const std::string& body) {
   }
   PendingWait& wait = *pending_wait_;
   wait.settled = true;
+  if (wait.counts_active) {
+    wait.counts_active = false;
+    service_->metrics()->decrement_waiters_active();
+  }
   wait_timer_.cancel();
   if (wait.waiter_id != 0) {
     service_->registry()->unregister(wait.channel, wait.waiter_id);
@@ -470,6 +536,10 @@ void Session::abort_wait() {
     return;
   }
   service_->metrics()->increment_waiter_aborted();
+  if (pending_wait_->counts_active) {
+    pending_wait_->counts_active = false;
+    service_->metrics()->decrement_waiters_active();
+  }
   if (pending_wait_->waiter_id != 0 && service_ != nullptr) {
     service_->registry()->unregister(pending_wait_->channel, pending_wait_->waiter_id);
   }

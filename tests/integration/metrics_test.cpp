@@ -17,6 +17,7 @@
 #include "common/test_executor.hpp"
 #include "common/test_helpers.hpp"
 #include "config/Config.hpp"
+#include "coordination/LeaseManager.hpp"
 #include "idempotency/CorrelationId.hpp"
 #include "idempotency/Fingerprint.hpp"
 #include "idempotency/IdempotencyService.hpp"
@@ -201,6 +202,86 @@ TEST_F(PgFixture, MetricsEndpointRendersWithoutUserData) {
   const test::HttpResult wrong_method = test::http_send(
       "127.0.0.1", server.port(), boost::beast::http::verb::post, "/metrics");
   EXPECT_EQ(wrong_method.status, 405);
+}
+
+std::string fp_of(const std::string& body) {
+  const idempotency::Fingerprint fp =
+      idempotency::fingerprint_for("POST", "/v1/operations", body);
+  if (!fp.ok) {
+    throw std::runtime_error("test body is not valid JSON");
+  }
+  return fp.hex;
+}
+
+TEST_F(PgFixture, WaiterConvergenceIsCountedOnce) {
+  // One gated owner + one waiter: waiter_completions and wait_time advance
+  // exactly once for the convergence, and the active gauge returns to zero.
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  NodeBundle node = make_node(/*gate_open=*/false);
+  GateOpener guard(*node.executor);
+  test::TestServer server(obs_config(), node.service);
+  const std::string key = unique_key("m-waitconv");
+  const std::string body = R"({"m":"wait"})";
+  const std::string channel = idempotency::WaiterRegistry::channel_for(key, fp_of(body));
+
+  const auto before = shared_metrics()->snapshot();
+  int owner_status = 0;
+  std::thread owner([&] {
+    owner_status = post_ops(server.port(), key, body).status;
+  });
+  auto executions_is = [&](std::uint64_t n) { return node.executor->executions() == n; };
+  const auto deadline = std::chrono::steady_clock::now() + 15000ms;
+  while (!executions_is(1) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(executions_is(1));
+
+  int waiter_status = 0;
+  std::string waiter_body;
+  std::thread waiter([&] {
+    const test::HttpResult result = post_ops(server.port(), key, body);
+    waiter_status = result.status;
+    waiter_body = result.body;
+  });
+  const auto reg_deadline = std::chrono::steady_clock::now() + 15000ms;
+  while (node.registry->waiter_count(channel) != 1 &&
+         std::chrono::steady_clock::now() < reg_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_EQ(node.registry->waiter_count(channel), 1u);
+  // Active gauge observes the suspended waiter.
+  EXPECT_GE(shared_metrics()->snapshot().waiters_active, 1u);
+
+  node.executor->open_gate();
+  owner.join();
+  waiter.join();
+  EXPECT_EQ(owner_status, 200);
+  EXPECT_EQ(waiter_status, 200);
+
+  const auto after = shared_metrics()->snapshot();
+  EXPECT_EQ(after.waiter_completions - before.waiter_completions, 1u);
+  EXPECT_GT(after.wait_time_ms_total - before.wait_time_ms_total, 0u);
+  EXPECT_EQ(after.waiters_active, before.waiters_active) << "gauge must return to baseline";
+}
+
+TEST_F(PgFixture, WindowADeferralIsCountedSeparately) {
+  // Lease held with no durable row (crash window A): immediate 202 counted
+  // as a deferral, NOT as a waiter start (nothing suspended).
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  test::TestServer server(obs_config(), service());
+  const std::string key = unique_key("m-window-a");
+  const auto held = leases().try_acquire(key);
+  ASSERT_EQ(held.result, coordination::LeaseAttempt::Result::Acquired);
+
+  const auto before = shared_metrics()->snapshot();
+  const test::HttpResult result = post_ops(server.port(), key, R"({"m":"wina"})");
+  EXPECT_EQ(result.status, 202);
+  const auto after = shared_metrics()->snapshot();
+  EXPECT_EQ(after.deferred_processing_answers - before.deferred_processing_answers, 1u);
+  EXPECT_EQ(after.waiters_started - before.waiters_started, 0u);
+  EXPECT_TRUE(leases().release(key, held.token));
 }
 
 }  // namespace

@@ -69,10 +69,17 @@ void CompletionSubscriber::run() {
           [this](const std::string& /*pattern*/, const std::string& channel,
                  const std::string& /*message*/) {
             // Wake-only: the channel names the logical operation; the row
-            // decides. Never parse the (empty) payload for meaning.
-            const std::size_t woken = registry_.notify(channel);
-            logger_.debug("subscriber wake channel=" + channel + " waiters=" +
-                          std::to_string(woken));
+            // decides. Never parse the (empty) payload for meaning. Any
+            // failure here must never kill the subscriber thread (below).
+            try {
+              const std::size_t woken = registry_.notify(channel);
+              logger_.debug("subscriber wake channel=" + channel + " waiters=" +
+                            std::to_string(woken));
+            } catch (const std::exception& e) {
+              logger_.error(std::string("subscriber dispatch failed: ") + e.what());
+            } catch (...) {
+              logger_.error("subscriber dispatch failed with unknown error");
+            }
           },
           stop_);
     } catch (const RedisError& e) {
@@ -81,6 +88,20 @@ void CompletionSubscriber::run() {
       }
       logger_.warning(std::string("subscriber connection lost: ") + e.what());
       // Loop around: backoff, resubscribe, sweep.
+    } catch (const std::exception& e) {
+      // Non-protocol failures (malformed replies during restarts, allocation
+      // stress): a background coordination thread must NEVER die from them.
+      // Back off and resubscribe like any other disconnect; the sweep below
+      // converges whoever was missed.
+      if (stop_.load()) {
+        return;
+      }
+      logger_.warning(std::string("subscriber error (recovering): ") + e.what());
+    } catch (...) {
+      if (stop_.load()) {
+        return;
+      }
+      logger_.warning("subscriber unknown error (recovering)");
     }
   }
 }
