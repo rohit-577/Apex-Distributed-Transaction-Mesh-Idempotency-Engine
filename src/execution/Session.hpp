@@ -32,6 +32,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 
@@ -125,6 +126,14 @@ class Session : public std::enable_shared_from_this<Session> {
   };
 
   boost::beast::tcp_stream stream_;
+  // Serialization for ALL session continuations. The I/O pool runs many
+  // threads, so timer expiries, registry wakes, and pool completions would
+  // otherwise execute concurrently on different threads while mutating
+  // pending_wait_, the timer generation, and the Beast stream (concurrent
+  // async stream operations are undefined behavior). Every handler below is
+  // bound to this strand (or posted through it), so session state is
+  // effectively single-threaded without ever blocking a thread.
+  boost::asio::strand<boost::asio::any_io_executor> strand_;
   boost::beast::flat_buffer buffer_;
   std::optional<boost::beast::http::request_parser<boost::beast::http::string_body>> parser_;
   boost::beast::http::request<boost::beast::http::string_body> request_;

@@ -4,6 +4,7 @@
 #include <memory>
 #include <utility>
 
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <nlohmann/json.hpp>
@@ -53,12 +54,13 @@ Session::Session(tcp::socket socket, const config::Config& config, std::string v
                  std::string phase, std::shared_ptr<idempotency::IdempotencyService> service,
                  asio::thread_pool* db_pool, observability::Logger& logger)
     : stream_(std::move(socket)),
+      strand_(stream_.get_executor()),
       config_(config),
       router_(std::move(version), std::move(phase)),
       service_(std::move(service)),
       db_pool_(db_pool),
       logger_(logger),
-      wait_timer_(stream_.get_executor()) {}
+      wait_timer_(strand_) {}
 
 Session::~Session() {
   // Last-resort waiter release (abrupt client disconnect with a suspended
@@ -86,8 +88,14 @@ void Session::do_read() {
   parser_.emplace();
   parser_->body_limit(kMaxBodyBytes);
   auto self = shared_from_this();
+  // Bound to the session strand: with a multi-threaded I/O pool, an
+  // unbound completion could otherwise run concurrently with a waiter wake
+  // or timer on another thread while both mutate session state.
   http::async_read(stream_, buffer_, *parser_,
-                   [self](beast::error_code ec, std::size_t /*bytes*/) { self->on_read(ec); });
+                   asio::bind_executor(
+                       strand_, [self](beast::error_code ec, std::size_t /*bytes*/) {
+                         self->on_read(ec);
+                       }));
 }
 
 void Session::on_read(beast::error_code ec) {
@@ -147,7 +155,7 @@ void Session::handle_ready(http::verb method, unsigned version, bool keep_alive)
   stream_.expires_never();
   auto self = shared_from_this();
   DependencyChecker::async_check(
-      stream_.get_executor(), Endpoint{config_.postgres_host, config_.postgres_port},
+      strand_, Endpoint{config_.postgres_host, config_.postgres_port},
       Endpoint{config_.redis_host, config_.redis_port}, kReadyTimeout,
       [self, version, keep_alive](DependencyStatus status) {
         self->stream_.expires_after(std::chrono::seconds(30));
@@ -243,8 +251,8 @@ void Session::handle_operations(unsigned version, bool keep_alive) {
                  // Unreachable by contract (handle() is no-throw), kept so a
                  // pool thread can never die from an escaping exception.
                }
-               asio::post(self->stream_.get_executor(),
-                          [self, outcome = std::move(outcome),
+                asio::post(self->strand_,
+                           [self, outcome = std::move(outcome),
                            op_request = std::move(op_request), version,
                            keep_alive]() mutable {
                             self->stream_.expires_after(std::chrono::seconds(30));
@@ -356,11 +364,15 @@ bool Session::reregister_for_wait() {
     wait.waiter_id = 0;
   }
   auto self_weak = std::weak_ptr<Session>(shared_from_this());
-  auto executor = stream_.get_executor();
+  // Wake callbacks arrive on the subscriber thread: they must only post
+  // back, and the post targets the session strand so a wake can never run
+  // concurrently with a timer expiry or recheck completion. Capturing the
+  // strand (not the session) keeps this from extending the session lifetime.
+  const auto strand = strand_;
   const idempotency::WaiterRegistry::Registration receipt = registry->register_waiter(
       wait.channel, self_weak,
-      [self_weak, executor] {
-        asio::post(executor, [self_weak] {
+      [self_weak, strand] {
+        asio::post(strand, [self_weak] {
           if (auto self = self_weak.lock()) {
             self->on_wait_wake();
           }
@@ -390,7 +402,7 @@ void Session::recheck_now() {
       outcome = self->service_->handle(request);
     } catch (const std::exception&) {
     }
-    asio::post(self->stream_.get_executor(),
+    asio::post(self->strand_,
                [self, outcome = std::move(outcome)]() mutable {
                  self->on_recheck_result(outcome);
                });
@@ -596,17 +608,22 @@ void Session::send_json(int status, const std::string& body, unsigned version, b
 
 void Session::do_write() {
   auto self = shared_from_this();
-  http::async_write(stream_, response_, [self](beast::error_code ec, std::size_t /*bytes*/) {
-    if (ec) {
-      self->do_close();
-      return;
-    }
-    if (!self->response_.keep_alive()) {
-      self->do_close();
-      return;
-    }
-    self->do_read();
-  });
+  // Strand-bound like the read path: exactly one completion runs at a time,
+  // so concurrent async operations on the stream are impossible by
+  // construction (Beast requires this).
+  http::async_write(stream_, response_,
+                    asio::bind_executor(strand_, [self](beast::error_code ec,
+                                                        std::size_t /*bytes*/) {
+                      if (ec) {
+                        self->do_close();
+                        return;
+                      }
+                      if (!self->response_.keep_alive()) {
+                        self->do_close();
+                        return;
+                      }
+                      self->do_read();
+                    }));
 }
 
 void Session::do_close() {

@@ -250,8 +250,18 @@ TEST_F(PgFixture, WaiterConvergenceIsCountedOnce) {
     std::this_thread::sleep_for(10ms);
   }
   ASSERT_EQ(node.registry->waiter_count(channel), 1u);
-  // Active gauge observes the suspended waiter.
-  EXPECT_GE(shared_metrics()->snapshot().waiters_active, 1u);
+  // Active gauge observes the suspended waiter. Registration is synchronous,
+  // but the gauge arms only after the first durable re-check returns on the
+  // I/O strand — a single immediate sample races that round trip, so poll
+  // with the same bounded-wait pattern used above (never sleep-to-pass: the
+  // deadline fails loudly if the gauge never arms).
+  const auto gauge_deadline = std::chrono::steady_clock::now() + 15000ms;
+  while (shared_metrics()->snapshot().waiters_active < 1u &&
+         std::chrono::steady_clock::now() < gauge_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GE(shared_metrics()->snapshot().waiters_active, 1u)
+      << "gauge must observe the suspended waiter";
 
   node.executor->open_gate();
   owner.join();

@@ -23,7 +23,9 @@
 #include "common/test_helpers.hpp"
 #include "config/Config.hpp"
 #include "idempotency/Fingerprint.hpp"
+#include "idempotency/IdempotencyService.hpp"
 #include "idempotency/WaiterRegistry.hpp"
+#include "observability/Metrics.hpp"
 #include "persistence/IdempotencyRepository.hpp"
 #include "persistence/PgConnection.hpp"
 
@@ -221,6 +223,97 @@ TEST_F(PgFixture, HundredWayDuplicateConvergesOnOneExecution) {
   }
   EXPECT_EQ(node.executor->executions(), 1u) << "INV-MUX-01 violated";
   EXPECT_EQ(node.registry->waiter_count(channel), 0u) << "waiters leaked";
+}
+
+TEST_F(PgFixture, WaiterContinuationsStaySerializedUnderTimerChurn) {
+  // Session-serialization regression: every continuation of one connection
+  // (timer expiry, registry wake, recheck completion) must be mutually
+  // exclusive — concurrent continuations could double-settle a response,
+  // corrupt the Beast stream, and unbalance the active gauge. 32 waiters
+  // churn through repeated 100 ms fallback-timer cycles (expiry -> durable
+  // re-check -> re-register -> re-arm) while the owner is gated, then all
+  // converge at once. Exactly-once completions, identical bodies, zero
+  // leaked slots, and a balanced gauge prove serialization held throughout
+  // the churn. State-gated throughout (fallback-wakeup count, waiter count),
+  // never time-based.
+  REQUIRE_PG();
+  REQUIRE_REDIS();
+  constexpr int kWaiters = 32;
+  idempotency::WaiterOptions options = test_waiter_options();
+  options.timeout_ms = 30000;  // Churn phase must never hit the waiter deadline.
+  NodeBundle node = make_node_with_options(options, /*gate_open=*/false);
+  GateOpener guard(*node.executor);
+  test::TestServer server(mux_config(), node.service);
+  const std::string key = unique_key("mux-churn");
+  const std::string body = R"({"mux":"churn"})";
+  const std::string channel = channel_of(key, body);
+
+  std::string owner_body;
+  int owner_status = 0;
+  std::thread owner([&] {
+    const test::HttpResult result = post_key(server.port(), key, body);
+    owner_status = result.status;
+    owner_body = result.body;
+  });
+  ASSERT_TRUE(wait_until([&] { return node.executor->executions() == 1; }));
+
+  // True metric baseline: snapshot before any waiter exists (nothing of this
+  // test suspended yet), so later deltas isolate exactly these waiters.
+  const auto before = node.service->metrics()->snapshot();
+
+  std::vector<int> statuses(kWaiters, 0);
+  std::vector<std::string> bodies(kWaiters);
+  std::latch go{1};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kWaiters; ++i) {
+    threads.emplace_back([&, i] {
+      go.wait();
+      const test::HttpResult result = post_key(server.port(), key, body);
+      statuses[i] = result.status;
+      bodies[i] = result.body;
+    });
+  }
+  go.count_down();
+  ASSERT_TRUE(wait_until([&] {
+    return node.registry->waiter_count(channel) == static_cast<std::size_t>(kWaiters);
+  })) << "not all duplicates became waiters";
+
+  // Require every waiter to be observably suspended (gauge fully armed)
+  // before churning. Registration alone does not arm the gauge — the first
+  // durable re-check must return on the session strand first.
+  ASSERT_TRUE(wait_until([&] {
+    return node.service->metrics()->snapshot().waiters_active ==
+           before.waiters_active + static_cast<std::uint64_t>(kWaiters);
+  })) << "not all waiters reached suspended state";
+  // Churn: every waiter fires multiple fallback timers before the owner
+  // completes. The count WILL advance on a live system; the deadline fails
+  // loudly if waiters are stuck.
+  ASSERT_TRUE(wait_until(
+      [&] {
+        return node.service->metrics()->snapshot().fallback_wakeups - before.fallback_wakeups >=
+               static_cast<std::uint64_t>(2 * kWaiters);
+      },
+      30000ms))
+      << "fallback timers never cycled (waiters stuck?)";
+
+  node.executor->open_gate();
+  owner.join();
+  for (std::thread& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(owner_status, 200);
+  for (int i = 0; i < kWaiters; ++i) {
+    EXPECT_EQ(statuses[i], 200) << "waiter " << i;
+    EXPECT_EQ(bodies[i], owner_body) << "waiter " << i << " diverged";
+  }
+  EXPECT_EQ(node.executor->executions(), 1u) << "INV-MUX-01 violated";
+  EXPECT_EQ(node.registry->waiter_count(channel), 0u) << "waiters leaked";
+  const auto after = node.service->metrics()->snapshot();
+  EXPECT_EQ(after.waiter_completions - before.waiter_completions,
+            static_cast<std::uint64_t>(kWaiters))
+      << "each waiter must converge exactly once (double-settle?)";
+  EXPECT_EQ(after.waiters_active, before.waiters_active) << "active gauge unbalanced";
 }
 
 TEST_F(PgFixture, ManyKeysExecuteOnceEachWithoutInterference) {

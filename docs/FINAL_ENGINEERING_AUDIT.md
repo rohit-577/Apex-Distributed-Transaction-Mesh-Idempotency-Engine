@@ -182,7 +182,8 @@ flat ~13 MB.
 
 ## 17. Test matrix
 
-162 tests total, hermetic subset skips infra-gated cases with reasons.
+163 tests total (162 + the RC-audit serialization test below), hermetic
+subset skips infra-gated cases with reasons.
 Per-phase suites (all passing, Debug + Release, live PG + Redis):
 
 - Phase 0 (gateway/config/deps): config, router, http, dependency-check,
@@ -192,7 +193,7 @@ Per-phase suites (all passing, Debug + Release, live PG + Redis):
 - Phase 2 (ownership/fencing): lease-contract, lease-redis (R1–R5, R7),
   fencing (F1–F9), cross-system (CASE 1/2/5/6, T1–T7 race).
 - Phase 3 (multiplexing): waiter-registry unit, multiplexing (P3-01/02/03,
-  P3-16/17, cancellation), waiter-lifecycle (P3-04/05/06/08/09/10/11/13/18),
+  P3-16/17, cancellation, timer-churn serialization), waiter-lifecycle (P3-04/05/06/08/09/10/11/13/18),
   cross-node (P3-14/15), subscriber spike, storm isolation.
 - Phase 4 (resilience): reaper (adopt/skip/age/race/stop/shutdown),
   resilience-docker (reconnect, PG restart), restart-smoke.ps1,
@@ -239,3 +240,35 @@ phantom state. NOT guaranteed: global exactly-once (external side effects
 need their own fencing), cross-key ordering, latency bounds, progress
 during total infra loss, or anything involving Redlock/Cluster/Streams/
 TLS/auth/Kubernetes (all explicitly out of scope).
+
+## 21. Release-candidate audit (post-Phase-6 independent verification)
+
+Starting commit `1c5cf2a`, clean tree. The audit re-ran everything from
+scratch (clean configure + Debug/Release builds, zero warnings; full
+suites; 10 consecutive scenario-H runs; 60 s soak; restart smoke; live
+Release binary checks) and found two genuine defects, both fixed with
+regression coverage. Final state: **163/163 Debug, 163/163 Release,
+hermetic 77 passed / 86 skipped (all infra-gated) / 0 failed.**
+
+1. **Missing session strand (concurrency defect, fixed).** `Session`
+   comments claimed "strand context", but no `asio::strand` existed: with
+   a multi-threaded I/O pool, timer expiries, registry wakes, and pool
+   completions could execute concurrently on different threads while
+   mutating `pending_wait_`, the timer generation, and the Beast stream
+   (concurrent async stream operations are undefined behavior). Fix: a
+   per-session `asio::strand` now serializes every continuation — timer
+   bound to it, read/write handlers `bind_executor`-bound, all posts and
+   the `/ready` probe routed through it. No behavior change besides
+   serialization; shared-pointer lifetimes already made destruction safe.
+   Regression test `WaiterContinuationsStaySerializedUnderTimerChurn`
+   (32 waiters × repeated fallback-timer cycles, then joint convergence:
+   exactly-once completions, identical bodies, balanced gauge) guards the
+   threatened invariants under churn. Verified honestly: the test passes
+   10/10 both pre- and post-fix (the race window is too narrow to catch
+   deterministically), so the fix itself rests on code inspection — the
+   test characterizes correct behavior, it does not reproduce the race.
+2. **Racy gauge assertion (test defect, fixed).**
+   `WaiterConvergenceIsCountedOnce` read `waiters_active` once immediately
+   after registry registration, but the gauge arms only after the first
+   durable re-check returns — failing ~1 in 6 runs. Fixed with the repo's
+   standard bounded-poll pattern (10/10 green since).

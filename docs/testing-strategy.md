@@ -1,6 +1,6 @@
 # Apex Testing Strategy
 
-Status: **unit / integration / concurrency Implemented and passing (162
+Status: **unit / integration / concurrency Implemented and passing (163
 tests), including the live-PostgreSQL + live-Redis matrix, resilience
 (docker-gated), migration lifecycle, and metrics coverage; `apex_bench`
 (Phase 6) measures with correctness gates but is not part of `ctest` timing.**
